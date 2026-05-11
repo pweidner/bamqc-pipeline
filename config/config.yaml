@@ -6,6 +6,7 @@ output_location: "/data/cephfs-1/scratch/groups/sanders/kiwi_tmp/BRDU-OP-ADCR11/
 ref: "hg38"  # or "mm10", "T2T"
 reference_path: "$HOME/work/mosaicatcher-pipeline-BIH/workflow/data/ref_genomes"
 window: 200000
+chromosomes: "1-22,X,Y"  # use "all" for every contig in the reference FASTA index
 bam_ext: ".sort.mdup.bam"
 tmp_dir: "$TMPDIR"
 # -------- Plots --------

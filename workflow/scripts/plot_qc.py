@@ -9,6 +9,30 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
+PLOT_ALIASES = {
+    "#Mapped": "alf_mapped_n",
+    "MappedFraction": "alf_mapped_frac",
+    "MappedProperFraction": "alf_mapped_proper_pair_frac",
+    "DuplicateFraction": "alf_duplicate_frac",
+    "UnmappedFraction": "alf_unmapped_frac",
+    "ErrorRate": "alf_error_frac",
+    "MedianInsertSize": "alf_insert_size_med",
+    "MedianCoverage": "alf_coverage_med",
+    "SDCoverage": "alf_coverage_sd",
+    "FractionCovered": "alf_covered_frac",
+    "entropy": "bin_entropy",
+    "spikiness": "bin_spikiness",
+    "gc_r": "bin_gc_r",
+    "total.read.count": "bin_total_read_count",
+}
+
+def add_plot_aliases(df):
+    """Expose stable plotting aliases while keeping final_qc.tsv prefixed."""
+    for alias, source in PLOT_ALIASES.items():
+        if alias not in df.columns and source in df.columns:
+            df[alias] = df[source]
+    return df
+
 def nice_num(x):
     if pd.isna(x): return "NA"
     try:
@@ -51,8 +75,8 @@ def page_summary(fig, row):
                     if pd.notna(row.get("entropy")) else "NA"),
         ("Spikiness", f"{float(row.get('spikiness', np.nan)):.4f}"
                       if pd.notna(row.get("spikiness")) else "NA"),
-        ("GC bias slope", f"{float(row.get('gc_slope', np.nan)):.4f}"
-                          if pd.notna(row.get("gc_slope")) else "NA"),
+        ("GC correlation", f"{float(row.get('gc_r', np.nan)):.4f}"
+                           if pd.notna(row.get("gc_r")) else "NA"),
         ("Preseq saturation", f"{100*float(row.get('preseq_saturation', np.nan)):.2f}%"
                               if pd.notna(row.get("preseq_saturation")) else "NA"),
     ]
@@ -103,12 +127,11 @@ def page_bars(fig, row):
 
 def page_counts_qc(fig, row):
     ax = fig.add_axes([0.1, 0.18, 0.85, 0.75])
-    labels = ["Entropy", "Spikiness", "GC slope", "GC R²"]
+    labels = ["Entropy", "Spikiness", "GC r"]
     vals = [
         row.get("entropy", np.nan),
         row.get("spikiness", np.nan),
-        row.get("gc_slope", np.nan),
-        row.get("gc_r2", np.nan)
+        row.get("gc_r", np.nan),
     ]
     # handle nan
     heights = [np.nan if pd.isna(v) else float(v) for v in vals]
@@ -199,8 +222,7 @@ def make_run_summary_pdf(df, out_pdf, preseq_dir=None):
         ("FractionCovered",       "Fraction covered",            "fraction",     False),
         ("entropy",               "Entropy",                     "",             False),
         ("spikiness",             "Spikiness",                   "",             False),
-        ("gc_slope",              "GC bias slope",               "",             False),
-        ("gc_r2",                 "GC fit R²",                   "",             False),
+        ("gc_r",                  "GC correlation",              "",             False),
         ("preseq_saturation",     "Preseq saturation",           "fraction",     False),
     ]
     metrics = [(c,t,y,l) for (c,t,y,l) in candidates if _col_ok(df, c)]
@@ -299,7 +321,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    df_full = pd.read_csv(args.final, sep="\t")
+    df_full = add_plot_aliases(pd.read_csv(args.final, sep="\t"))
 
     # NEW: only write summary when explicitly requested
     if args.make_summary:

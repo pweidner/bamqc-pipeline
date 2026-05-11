@@ -1,0 +1,27 @@
+# Copy to config/config.local.yaml and adjust paths for a specific run.
+# config/config.local.yaml is ignored by Git.
+
+# Core IO
+data_location: "/path/to/input/bams"
+output_location: "/path/to/output/bamqc"
+
+# Reference
+ref: "hg38"
+reference_path: "/path/to/ref_genomes"
+window: 200000
+chromosomes: "1-22,X,Y"  # use "all" for every contig in the reference FASTA index
+bam_ext: ".sort.mdup.bam"
+tmp_dir: "/tmp"
+
+# Plots
+plot: false
+
+# Ashley QC
+ashleys:
+  enabled: true
+  bin: "/Users/pweidne/Documents/projects/ashleys-qc/bin/ashleys.py"
+  model_path: "/Users/pweidne/Documents/projects/ashleys-qc/models/svc_default.pkl"
+  win_sizes: [5000000, 2000000, 1000000, 800000, 600000, 400000, 200000]
+  threads: 32
+  mem_mb: 200000
+  conda_env: "envs/ashleys.yaml"

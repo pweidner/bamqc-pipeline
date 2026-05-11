@@ -27,7 +27,3 @@ dependencies:
 
   # ----- Python plotting (rarely needed but harmless) -----
   - matplotlib
-
-  - pip:
-    - tqdm
-    - -e /data/cephfs-1/home/users/pweidne_m/work/ashleys-qc

@@ -27,21 +27,21 @@ for (i in seq(1, length(argv), by = 2)) {
 
 # Required args
 if (is.null(args$final) || is.null(args$out)) {
-  stop("Usage: plot_summary.R --final final_qc.tsv --out summary.pdf [--count-col 'total.read.count']")
+  stop("Usage: plot_summary.R --final final_qc.tsv --out summary.pdf [--count-col 'bin_total_read_count']")
 }
 
 final_path <- args$final
 out_pdf    <- args$out
-count_col  <- if (!is.null(args[["count-col"]])) args[["count-col"]] else "total.read.count"
+count_col  <- if (!is.null(args[["count-col"]])) args[["count-col"]] else "bin_total_read_count"
 
 # quiet readr column-spec chatter
 df <- suppressMessages(
   readr::read_tsv(final_path, progress = FALSE, guess_max = 1e6, show_col_types = FALSE)
 )
 
-has_col <- function(nm) nm %in% names(df)
-get_col <- function(nm, default = NA_real_) {
-  if (has_col(nm)) df[[nm]] else rep(default, nrow(df))
+get_col_any <- function(candidates, default = NA_real_) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) > 0) df[[hit[1]]] else rep(default, nrow(df))
 }
 
 # pick palette
@@ -60,20 +60,19 @@ theme_run <- theme_minimal(base_size = 11) +
   theme(panel.grid.minor = element_blank(),
         plot.title = element_text(face = "bold"))
 
-# normalise & prepare columns
-TotalReadCount <- get_col("total.read.count")
-DuplicateFraction <- get_col("DuplicateFraction")
-Entropy    <- get_col("entropy")
-Spikiness  <- get_col("spikiness")
+# Normalise current prefixed output names, with legacy fallbacks for older runs.
+TotalReadCount <- get_col_any(c(count_col, "bin_total_read_count", "total.read.count"))
+DuplicateFraction <- get_col_any(c("alf_duplicate_frac", "DuplicateFraction"))
+Entropy    <- get_col_any(c("bin_entropy", "entropy"))
+Spikiness  <- get_col_any(c("bin_spikiness", "spikiness"))
 
-MappedFraction       <- get_col("MappedFraction")
-MappedProperFraction <- get_col("MappedProperFraction")
-MedianCoverage       <- get_col("MedianCoverage")
-MedianInsertSize     <- get_col("MedianInsertSize")
-ErrorRate            <- get_col("ErrorRate")
-GCSlope              <- get_col("gc_slope")
-GCR2                 <- get_col("gc_r2")
-PreseqSat            <- get_col("preseq_saturation")
+MappedFraction       <- get_col_any(c("alf_mapped_frac", "MappedFraction"))
+MappedProperFraction <- get_col_any(c("alf_mapped_proper_pair_frac", "MappedProperFraction"))
+MedianCoverage       <- get_col_any(c("alf_coverage_med", "MedianCoverage"))
+MedianInsertSize     <- get_col_any(c("alf_insert_size_med", "MedianInsertSize"))
+ErrorRate            <- get_col_any(c("alf_error_frac", "ErrorRate"))
+GCR                  <- get_col_any(c("bin_gc_r", "gc_pearson_r"))
+PreseqSat            <- get_col_any(c("preseq_saturation"))
 
 # ---------- PAGE 1 ----------
 # A) jitter+violin+box of TotalReadCount
@@ -153,7 +152,7 @@ plots2 <- c(
   list(make_hist(ErrorRate, "Error rate", "fraction", to_percent = TRUE)),
   list(make_jvb(MedianCoverage, "Median coverage", "x (log10)", log10y = TRUE)),
   list(make_jvb(MedianInsertSize, "Median insert size", "bp", log10y = FALSE)),
-  list(make_scatter(GCSlope, GCR2, "GC slope vs R²", "GC slope", "GC R²")),
+  list(make_hist(GCR, "GC correlation", "Pearson r")),
   list(make_hist(PreseqSat, "Preseq saturation", "fraction", to_percent = TRUE))
 )
 

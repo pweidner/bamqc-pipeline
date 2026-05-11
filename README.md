@@ -1,4 +1,4 @@
-# BamQC-pipeline 🚀
+# bamqc-pipeline 🚀
 
 A fast, reproducible **Snakemake** workflow for **QC of BAMs** — alignment stats, binned-coverage metrics, library complexity, and optional **Ashley’s QC**.
 
@@ -14,11 +14,13 @@ A fast, reproducible **Snakemake** workflow for **QC of BAMs** — alignment sta
 
 ## ⚙️ 1. Installation
 
-Clone the repos into your work folder (note that the pipeline needs ashleys-qc repo as well):
+Clone the repos into a work folder without spaces in the path. Ashley QC is only
+needed when `ashleys.enabled: true`.
 
 ```bash
 cd
-cd work/
+mkdir -p work
+cd work
 git clone https://github.com/pweidner/bamqc-pipeline.git
 git clone https://github.com/friendsofstrandseq/ashleys-qc.git
 cd bamqc-pipeline
@@ -36,12 +38,18 @@ conda activate snakemake
 
 ## 🧾 2. Configuration (`config/config.yaml`)
 
+For cluster work, keep tracked defaults in `config/config.yaml` and put
+machine- or run-specific overrides in ignored `config/config.local.yaml`.
+If `config/config.local.yaml` exists, it is loaded automatically on top of the
+tracked config.
+
 ```yaml
 ref: hg38
 reference_path: /ref/dir               # contains hg38.fa (+.fai)
 data_location:  /path/to/input         # FLAT: *.sort.mdup.bam; HIER: <sample>/bam/*.sort.mdup.bam
 output_location: /path/to/output
 window: 200000
+chromosomes: "1-22,X,Y"                # or "all" for every reference contig
 plot: true
 
 bam_ext: ".sort.mdup.bam"
@@ -67,7 +75,9 @@ ashleys:
 ## ▶️ 3. Run
 
 ```bash
-snakemake --config data_location=/data/runA output_location=/data/runA/bamqc --profile workflow/profiles --keep-going
+cp config/config.local.example.yaml config/config.local.yaml
+# edit config/config.local.yaml for the run
+snakemake --profile workflow/profiles --keep-going
 ```
 
 ---
@@ -76,12 +86,9 @@ snakemake --config data_location=/data/runA output_location=/data/runA/bamqc --p
 
 ```
 output_location/
-├── final_qc.tsv                         # 🧩 Alfred + counts-based + counts.info + preseq QC + Ashley’s columns
-│
-├── results/                             # 📊 Per tool deliverables
-│   ├── final_qc.tsv
-│   ├── preseq_metrics.tsv               # Preseq summary stats across libraries
-│   └── alignment_summary_metrics.tsv    # Alfred summary across libraries
+├── final_qc.tsv                         # 🧩 Alfred + binned coverage + preseq QC
+├── final_qc_with_ashleys.tsv            # 🧠 optional Ashley predictions/features
+├── alignment_summary_metrics.tsv        # parsed Alfred summary across libraries
 │
 ├── metadata/
 │   └── library_map.tsv                  # cell <-> Library mapping for sanity checks
@@ -100,10 +107,8 @@ output_location/
 │
 ├── ashleys/
 │   ├── features.tsv                     # merged/computed Ashley features
-│   ├── features.norm.tsv                # features keyed by Library
 │   └── prediction/
-│       ├── prediction.tsv               # merged labels or predictions
-│       └── prediction.norm.tsv          # normalized to Library
+│       └── prediction.tsv               # merged labels or predictions
 │
 └── plots/
     ├── per-lib-qc/{Library}.qc.pdf      # optional per-lib PDF
@@ -251,6 +256,7 @@ Derived from **`preseq lc_extrap`**, estimating how many *unique* DNA fragments 
 |------|--------|----------------|
 | `preseq_distinct_at_observed` | Expected number of distinct fragments at observed depth | Higher = more complex library. |
 | `preseq_saturation` | Distinct / total reads at observed depth | **0 = highly duplicated**, **1 = highly complex**. |
+| `preseq_curve_status` | Whether the preseq curve was parsed as `ok`, `missing`, `empty`, `stub`, or `error`. | Non-`ok` values should be checked in logs. |
 
 **Rule of thumb**
 - `preseq_saturation ≈ 1` → sequencing deeper will still yield new information  
@@ -319,7 +325,6 @@ For each window size (`5mb`, `2mb`, `1mb`, `0_8mb`, `0_6mb`, `0_4mb`, `0_2mb`):
 - **Fold80 penalty** follows the Picard metric (ideal = 1, higher = less uniform).
 - **Preseq** metrics allow extrapolation of unique reads vs sequencing depth.
 - **Ashley’s QC** integrates pretrained classification of Strand-seq libraries by coverage pattern and W→C balance.
-- **Mosaicatcher** fractions (`p_good`, etc.) summarize the final usable subset for downstream analyses like count plots and phasing.
 
 ---
 
