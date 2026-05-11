@@ -178,10 +178,30 @@ def discover_bams(root: Path, bam_ext: str):
     print("[ERROR] No BAMs found under " + str(root) + ". Looked for '*" + be + "' in FLAT mode or '*/bam/*" + be + "'", file=sys.stderr)
     return None, {}, {}
 
+def discover_sctrip_counts_info(root: Path, mode: str):
+    """Find mosaicatcher/scTRIP counts info files for HIER inputs.
+
+    Prefer sample-level *.info_raw tables because they retain all cells. Fall back
+    to *.info only for older runs without raw tables.
+    """
+    if mode != "HIER" or not root.exists():
+        return []
+    paths = []
+    for child in sorted(p for p in root.iterdir() if p.is_dir()):
+        counts_dir = child / "counts"
+        if not counts_dir.is_dir():
+            continue
+        raw = sorted(counts_dir.glob("*.info_raw"))
+        fallback = sorted(counts_dir.glob("*.info"))
+        paths.extend(str(p.resolve()) for p in (raw if raw else fallback))
+    return paths
+
 MODE, BAM_OF, SAMPLE_OF = discover_bams(DATA_ROOT, BAM_EXT)
 SAMPLES = sorted(BAM_OF.keys())
 if not SAMPLES:
     raise ValueError("[CONFIG ERROR] no BAM files discovered. Check data_location and bam_ext.")
+SCTRIP_COUNTS_INFO_FILES = discover_sctrip_counts_info(DATA_ROOT, MODE)
+SCTRIP_COUNTS_AVAILABLE = len(SCTRIP_COUNTS_INFO_FILES) > 0
 
 BAI_OF = {lib: find_bam_index(bam) for lib, bam in BAM_OF.items()}
 missing_bai = [BAM_OF[lib] for lib, bai in BAI_OF.items() if bai is None]
@@ -222,6 +242,7 @@ SAMPLE_IDS = sorted(set(SAMPLE_OF.values()))
 print("- Discovered samples: " + str(len(SAMPLE_IDS)))
 print("- discovered libraries: " + str(len(SAMPLES)))
 print("  head -n 8: " + ", ".join(SAMPLES[:8]) + ("..." if len(SAMPLES)>8 else ""))
+print("- scTRIP counts info files: " + str(len(SCTRIP_COUNTS_INFO_FILES)))
 print("- target chromosomes: " + ("all reference contigs" if not TARGET_CHROMS else ",".join(TARGET_CHROMS)))
 print("- Ashley: " + ("ENABLED" if ASH_ENABLED else "disabled"))
 print("================================\n")
@@ -247,6 +268,7 @@ ASH_PRED_TSV   = out_path("ashleys", "prediction", "prediction.tsv")
 
 # metadata
 LIBMAP_TSV     = out_path("metadata", "library_map.tsv")
+SCTRIP_COUNTS_INFO_TSV = out_path("sctrip_counts_info.tsv")
 
 # Helper for Ashley window sizes
 def ash_win_str():
@@ -266,6 +288,8 @@ ALL_TARGETS = [
     *expand(out_path("preseq", "{sample}.lc.tsv"), sample=SAMPLES),
     *plot_targets
 ]
+if SCTRIP_COUNTS_AVAILABLE:
+    ALL_TARGETS.append(SCTRIP_COUNTS_INFO_TSV)
 if ASH_ENABLED:
     ALL_TARGETS.append(out_path("final_qc_with_ashleys.tsv"))
 
@@ -594,10 +618,39 @@ rule qc_from_counts:
           --out {output.qc} > {log} 2>&1
         """
 
+rule aggregate_sctrip_counts_info:
+    input:
+        counts=SCTRIP_COUNTS_INFO_FILES,
+        libmap=LIBMAP_TSV
+    output:
+        counts=SCTRIP_COUNTS_INFO_TSV
+    threads: 1
+    resources:
+        mem_mb=4000,
+        partition="short",
+        qos="normal",
+        time="00:20:00"
+    conda: "envs/py_env.yaml"
+    log:
+        out_path("logs", "aggregate_sctrip_counts_info.log")
+    params:
+        bam_ext=BAM_EXT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log})" "$(dirname {output.counts})"
+        python -u workflow/scripts/aggregate_sctrip_counts_info.py \
+          --libmap {input.libmap} \
+          --bam-ext "{params.bam_ext}" \
+          --out {output.counts} \
+          {input.counts} > {log} 2>&1
+        """
+
 rule make_sample_final_qc:
     input:
         alfred=out_path("alignment_summary_metrics.tsv"),
-        qc2=expand(out_path("qc-from-bins", "{sample}.counts_qc.tsv"), sample=SAMPLES)
+        qc2=expand(out_path("qc-from-bins", "{sample}.counts_qc.tsv"), sample=SAMPLES),
+        sctrip=SCTRIP_COUNTS_INFO_TSV if SCTRIP_COUNTS_AVAILABLE else []
     output:
         final=out_path("final_qc.tsv")
     threads: 2
@@ -747,6 +800,22 @@ rule make_sample_final_qc:
         # Merge
         merged = dfA.merge(dfQ, on="Library", how="left")
 
+        def input_paths(x):
+            if x is None:
+                return []
+            if isinstance(x, str):
+                return [x] if x else []
+            return [str(v) for v in x if str(v)]
+
+        sctrip_paths = input_paths(getattr(input, "sctrip", []))
+        if sctrip_paths and os.path.exists(sctrip_paths[0]) and os.path.getsize(sctrip_paths[0]) > 0:
+            dfS = pd.read_csv(sctrip_paths[0], sep="\t")
+            if "Library" not in dfS.columns:
+                raise ValueError("[make_sample_final_qc] sctrip_counts_info.tsv lacks 'Library'")
+            valid = dfS["Library"].notna() & (dfS["Library"].astype(str).str.len() > 0)
+            dfS = dfS.loc[valid].drop_duplicates(subset=["Library"], keep="first")
+            merged = merged.merge(dfS, on="Library", how="left")
+
         # Column order: IDs first
         id_cols = ["Library", "Sample"]
         other_cols = [c for c in merged.columns if c not in id_cols]
@@ -841,7 +910,12 @@ rule write_library_map:
         rows = []
         for lib, bam in BAM_OF.items():
             cell = os.path.basename(bam)  # e.g. A5455_L2_1001.sort.mdup.bam
-            rows.append({"cell": cell, "Library": lib})
+            rows.append({
+                "cell": cell,
+                "bam": bam,
+                "Sample": SAMPLE_OF.get(lib, infer_sample_from_library(lib)),
+                "Library": lib,
+            })
         pd.DataFrame(rows).to_csv(output[0], sep="\t", index=False)
 
 # Merge existing Ashley features or compute them; then normalize to Library
