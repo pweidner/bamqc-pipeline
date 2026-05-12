@@ -1,9 +1,13 @@
-# Snakefile (cleaned header + discovery + outputs)
+# Snakefile
 configfile: "config/config.yaml"
 
 # =========================== Imports & helpers ============================
-import os, sys, subprocess, re
+import os, sys, re
 from pathlib import Path
+
+LOCAL_CONFIG = "config/config.local.yaml"
+if os.path.exists(LOCAL_CONFIG):
+    configfile: LOCAL_CONFIG
 
 def _bool(x, default=False):
     if x is None:
@@ -21,14 +25,61 @@ def sanitize_suffix(x, default):
     x = re.sub(r"\s+", "", x)
     return x
 
-# -------------------- Read config with sensible defaults ------------------
-# keep Path.resolve for DATA/OUT roots (good practice)
-DATA_ROOT = Path(config["data_location"]).resolve()
-OUT_ROOT  = Path(config["output_location"]).resolve()
+def expand_path(value, default=None):
+    if value is None:
+        value = default
+    if value is None:
+        return None
+    return os.path.expandvars(os.path.expanduser(str(value)))
 
-# paste0-style REF_FASTA
+def abs_path(value, default=None):
+    expanded = expand_path(value, default=default)
+    if expanded is None:
+        return None
+    return Path(expanded).resolve()
+
+def parse_chromosomes(value):
+    """Parse config chromosomes like '1-22,X,Y', ['1', '2'], or 'all'."""
+    if value is None:
+        value = "1-22,X,Y"
+    if isinstance(value, str):
+        if value.strip().lower() in ("all", "*", "none", ""):
+            return []
+        tokens = [x.strip() for x in value.split(",") if x.strip()]
+    else:
+        tokens = [str(x).strip() for x in value if str(x).strip()]
+
+    chroms = []
+    for token in tokens:
+        if re.fullmatch(r"\d+\s*-\s*\d+", token):
+            start, end = [int(x) for x in re.split(r"\s*-\s*", token)]
+            step = 1 if start <= end else -1
+            chroms.extend(str(i) for i in range(start, end + step, step))
+        else:
+            chroms.append(token)
+    return chroms
+
+def infer_sample_from_library(library_id):
+    m = re.match(r"(.+?)_A\d+_L\d+_i\d+.*$", library_id)
+    if m:
+        return m.group(1)
+    return library_id.split("_", 1)[0] if "_" in library_id else library_id
+
+def find_bam_index(bam):
+    candidates = [bam + ".bai"]
+    if bam.endswith(".bam"):
+        candidates.append(bam[:-4] + ".bai")
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+# -------------------- Read config with sensible defaults ------------------
+DATA_ROOT = abs_path(config["data_location"])
+OUT_ROOT  = abs_path(config["output_location"])
+
 ref = str(config.get("ref", "hg38")).strip()
-reference_path = str(config.get("reference_path", "")).strip()
+reference_path = expand_path(config.get("reference_path", "")).strip()
 if not reference_path:
     raise ValueError("[CONFIG ERROR] 'reference_path' must be set in config.yaml")
 REF_FASTA = reference_path + "/" + ref + ".fa"
@@ -37,19 +88,23 @@ REF_FASTA = reference_path + "/" + ref + ".fa"
 WIN_SIZE    = int(config.get("window", 200000))
 PLOT_TOGGLE = _bool(config.get("plot", False))
 BAM_EXT     = sanitize_suffix(config.get("bam_ext"), ".sort.mdup.bam")
-TMP_DIR     = str(config.get("tmp_dir", "/data/cephfs-1/scratch/groups/sanders/tmp"))
+TMP_DIR     = expand_path(config.get("tmp_dir", "/tmp"))
+TARGET_CHROMS = parse_chromosomes(config.get("chromosomes", "1-22,X,Y"))
+TARGET_CHROMS_STR = " ".join(TARGET_CHROMS)
 
 # Ashley defaults + overrides
 ASH_DEFAULT = {
     "enabled": True,
-    "bin": "/data/cephfs-1/home/users/pweidne_m/work/ashleys-qc/bin/ashleys.py",
-    "model_path": "/data/cephfs-1/home/users/pweidne_m/work/ashleys-qc/models/svc_default.pkl",
+    "bin": "",
+    "model_path": "",
     "win_sizes": [5_000_000, 2_000_000, 1_000_000, 800_000, 600_000, 400_000, 200_000],
     "threads": 32,
     "mem_mb": 200000,
     "conda_env": "envs/ashleys.yaml",
 }
 ASH = {**ASH_DEFAULT, **config.get("ashleys", {})}
+ASH["bin"] = expand_path(ASH.get("bin", ""))
+ASH["model_path"] = expand_path(ASH.get("model_path", ""))
 ASH_ENABLED = _bool(ASH.get("enabled", True))
 
 # -------------------------- Discover BAMs (FLAT / HIER via find) --------------------------
@@ -76,7 +131,7 @@ def discover_bams(root: Path, bam_ext: str):
 
     if not root.exists():
         print("[ERROR] data_location does not exist: " + str(root), file=sys.stderr)
-        return None, {}
+        return None, {}, {}
 
     be = str(bam_ext or "").strip()
     if be == "":
@@ -90,15 +145,18 @@ def discover_bams(root: Path, bam_ext: str):
     if flat:
         mode = "FLAT"
         bam_of = {}
+        sample_of = {}
         for p in sorted(flat):
             sid = strip_bam_suffix(p.name)
             bam_of[sid] = str(p.resolve())
+            sample_of[sid] = infer_sample_from_library(sid)
         print("[discover_bams] FLAT: found " + str(len(bam_of)) + " bams under " + str(root), file=sys.stderr)
-        return mode, bam_of
+        return mode, bam_of, sample_of
 
     # HIER search (child/<bam> directories)
     mode = "HIER"
     bam_of = {}
+    sample_of = {}
     for child in sorted(p for p in root.iterdir() if p.is_dir()):
         bamdir = child / "bam"
         if not bamdir.is_dir():
@@ -112,15 +170,94 @@ def discover_bams(root: Path, bam_ext: str):
             if sid in bam_of:
                 print("[WARN] Duplicate library ID " + sid + " (old: " + bam_of[sid] + " new: " + str(p) + ")", file=sys.stderr)
             bam_of[sid] = str(p.resolve())
+            sample_of[sid] = child.name
 
     if bam_of:
-        return mode, bam_of
+        return mode, bam_of, sample_of
 
     print("[ERROR] No BAMs found under " + str(root) + ". Looked for '*" + be + "' in FLAT mode or '*/bam/*" + be + "'", file=sys.stderr)
-    return None, {}
+    return None, {}, {}
 
-MODE, BAM_OF = discover_bams(DATA_ROOT, BAM_EXT)
+def discover_sctrip_counts_info(root: Path, mode: str):
+    """Find mosaicatcher/scTRIP counts info files for HIER inputs.
+
+    Prefer sample-level *.info_raw tables because they retain all cells. Fall back
+    to *.info only for older runs without raw tables.
+    """
+    if mode != "HIER" or not root.exists():
+        return []
+    paths = []
+    for child in sorted(p for p in root.iterdir() if p.is_dir()):
+        counts_dir = child / "counts"
+        if not counts_dir.is_dir():
+            continue
+        raw = sorted(counts_dir.glob("*.info_raw"))
+        fallback = sorted(counts_dir.glob("*.info"))
+        paths.extend(str(p.resolve()) for p in (raw if raw else fallback))
+    return paths
+
+def discover_ashley_tables(root: Path, mode: str, kind: str):
+    """Find existing Ashley tables without recursively scanning the whole run."""
+    if not root.exists():
+        return []
+    if kind == "features":
+        rels = [
+            Path("predictions/ashleys_features.tsv"),
+            Path("prediction/ashleys_features.tsv"),
+            Path("predicitons/ashleys_features.tsv"),
+        ]
+    elif kind == "predictions":
+        rels = [
+            Path("cell_selection/labels.tsv"),
+            Path("predictions/labels.tsv"),
+            Path("prediction/labels.tsv"),
+            Path("predicitons/labels.tsv"),
+            Path("predictions/prediction.tsv"),
+            Path("prediction/prediction.tsv"),
+            Path("predicitons/prediction.tsv"),
+        ]
+    else:
+        raise ValueError("unknown Ashley table kind: " + str(kind))
+
+    roots = sorted(p for p in root.iterdir() if p.is_dir()) if mode == "HIER" else [root]
+    paths = []
+    seen = set()
+    for base in roots:
+        for rel in rels:
+            path = base / rel
+            if path.is_file():
+                resolved = str(path.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    paths.append(resolved)
+    return paths
+
+MODE, BAM_OF, SAMPLE_OF = discover_bams(DATA_ROOT, BAM_EXT)
 SAMPLES = sorted(BAM_OF.keys())
+if not SAMPLES:
+    raise ValueError("[CONFIG ERROR] no BAM files discovered. Check data_location and bam_ext.")
+SCTRIP_COUNTS_INFO_FILES = discover_sctrip_counts_info(DATA_ROOT, MODE)
+SCTRIP_COUNTS_AVAILABLE = len(SCTRIP_COUNTS_INFO_FILES) > 0
+ASH_FEATURE_SOURCE_FILES = discover_ashley_tables(DATA_ROOT, MODE, "features")
+ASH_PRED_SOURCE_FILES = discover_ashley_tables(DATA_ROOT, MODE, "predictions")
+ASH_NEEDS_FEATURE_RUN = ASH_ENABLED and len(ASH_FEATURE_SOURCE_FILES) == 0
+ASH_NEEDS_PRED_RUN = ASH_ENABLED and len(ASH_PRED_SOURCE_FILES) == 0
+ASH_MERGE_ENABLED = ASH_ENABLED or len(ASH_PRED_SOURCE_FILES) > 0
+ASH_FEATURES_AVAILABLE = ASH_ENABLED or len(ASH_FEATURE_SOURCE_FILES) > 0
+
+BAI_OF = {lib: find_bam_index(bam) for lib, bam in BAM_OF.items()}
+missing_bai = [BAM_OF[lib] for lib, bai in BAI_OF.items() if bai is None]
+if missing_bai:
+    raise ValueError("[CONFIG ERROR] missing BAM index (.bam.bai or .bai) for: " + ", ".join(missing_bai[:5]))
+
+if not Path(REF_FASTA).exists():
+    raise ValueError("[CONFIG ERROR] reference FASTA does not exist: " + REF_FASTA)
+if not Path(REF_FASTA + ".fai").exists():
+    raise ValueError("[CONFIG ERROR] reference FASTA index does not exist: " + REF_FASTA + ".fai")
+if ASH_ENABLED and (ASH_NEEDS_FEATURE_RUN or ASH_NEEDS_PRED_RUN) and (not ASH.get("bin") or not Path(ASH["bin"]).exists()):
+    raise ValueError("[CONFIG ERROR] Ashley computation is needed but ashleys.bin is missing or does not exist")
+if ASH_ENABLED and ASH_NEEDS_PRED_RUN and (not ASH.get("model_path") or not Path(ASH["model_path"]).exists()):
+    raise ValueError("[CONFIG ERROR] Ashley prediction is needed but ashleys.model_path is missing or does not exist")
 
 # ================================= ASCII Art =================================
 print(r"""
@@ -143,11 +280,16 @@ print("- data_location: " + str(DATA_ROOT))
 print("- output_location: " + str(OUT_ROOT))
 print("- reference: " + REF_FASTA)
 print("- Mode: " + str(MODE))
-SAMPLE_IDS = sorted({s.split("_", 1)[0] for s in SAMPLES})
+SAMPLE_IDS = sorted(set(SAMPLE_OF.values()))
 print("- Discovered samples: " + str(len(SAMPLE_IDS)))
 print("- discovered libraries: " + str(len(SAMPLES)))
 print("  head -n 8: " + ", ".join(SAMPLES[:8]) + ("..." if len(SAMPLES)>8 else ""))
-print("- Ashley: " + ("ENABLED" if ASH_ENABLED else "disabled"))
+print("- scTRIP counts info files: " + str(len(SCTRIP_COUNTS_INFO_FILES)))
+print("- target chromosomes: " + ("all reference contigs" if not TARGET_CHROMS else ",".join(TARGET_CHROMS)))
+print("- Ashley computation: " + ("ENABLED" if ASH_ENABLED else "disabled"))
+print("- Ashley existing prediction tables: " + str(len(ASH_PRED_SOURCE_FILES)))
+print("- Ashley existing feature tables: " + str(len(ASH_FEATURE_SOURCE_FILES)))
+print("- Ashley merge into final_qc.tsv: " + ("yes" if ASH_MERGE_ENABLED else "no"))
 print("================================\n")
 
 # ---------------------------- Output structure ----------------------------
@@ -160,27 +302,59 @@ DIR_BINS   = out_path("binned")
 DIR_QC2    = out_path("qc-from-bins")
 DIR_PRESEQ = out_path("preseq")
 DIR_PLOTS  = out_path("plots")
-DIR_RESULTS  = out_path("results")
-DIR_METADATA = out_path("metadata")
 
 WIN_BED_GZ = out_path("windows_" + str(WIN_SIZE) + ".bed.gz")
 WIN_GC_GZ  = out_path("windows_" + str(WIN_SIZE) + ".gc.tsv.gz")
+FINAL_QC_TSV = out_path("final_qc.tsv")
+CORE_QC_TSV = out_path("intermediate", "core_qc.tsv")
 
 # Ashley
-DIR_ASH        = out_path("ashleys")
-DIR_ASH_LOGS   = out_path("ashleys", "logs")
 ASH_FEATURES   = out_path("ashleys", "features.tsv")
-ASH_FEAT_NORM  = out_path("ashleys", "features.norm.tsv")
 ASH_PRED_DIR   = out_path("ashleys", "prediction")
 ASH_PRED_TSV   = out_path("ashleys", "prediction", "prediction.tsv")
-ASH_PRED_NORM  = out_path("ashleys", "prediction", "prediction.norm.tsv")
 
 # metadata
 LIBMAP_TSV     = out_path("metadata", "library_map.tsv")
+SCTRIP_COUNTS_INFO_TSV = out_path("sctrip_counts_info.tsv")
 
 # Helper for Ashley window sizes
 def ash_win_str():
     return " ".join(str(w) for w in ASH.get("win_sizes", ASH_DEFAULT["win_sizes"]))
+
+LARGE_BAM_THRESHOLD_MB = int(config.get("large_bam_threshold_mb", 800))
+BAM_RESOURCE_DEFAULTS = {
+    "alfred_qc": {
+        "small": {"partition": "short", "mem_mb": 8000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 16000, "time": "1-00:00:00"},
+    },
+    "coverage_counts": {
+        "small": {"partition": "short", "mem_mb": 12000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 32000, "time": "1-00:00:00"},
+    },
+    "preseq_lc": {
+        "small": {"partition": "short", "mem_mb": 8000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 16000, "time": "1-00:00:00"},
+    },
+}
+BAM_RESOURCE_CONFIG = config.get("bam_resources", {})
+
+
+def bam_is_large(sample):
+    try:
+        return os.path.getsize(BAM_OF[sample]) > LARGE_BAM_THRESHOLD_MB * 1024 * 1024
+    except OSError as e:
+        raise ValueError("[CONFIG ERROR] could not stat BAM for resource selection: " + BAM_OF[sample] + " (" + str(e) + ")")
+
+
+def bam_resource_value(rule_name, sample, key):
+    profile = "large" if bam_is_large(sample) else "small"
+    rule_cfg = BAM_RESOURCE_CONFIG.get(rule_name, {})
+    profile_cfg = rule_cfg.get(profile, {})
+    return profile_cfg.get(key, BAM_RESOURCE_DEFAULTS[rule_name][profile][key])
+
+
+def bam_resource(rule_name, key):
+    return lambda wildcards: bam_resource_value(rule_name, wildcards.sample, key)
 
 # ============================== RULE ALL =====================================
 plot_targets = []
@@ -188,16 +362,16 @@ if PLOT_TOGGLE:
     plot_targets = expand(out_path("plots", "per-lib-qc", "{sample}.qc.pdf"), sample=SAMPLES)
 
 ALL_TARGETS = [
+    LIBMAP_TSV,
     out_path("alignment_summary_metrics.tsv"),
-    out_path("final_qc.tsv"),
+    FINAL_QC_TSV,
     out_path("plots", "run_summary.pdf"),
     # always build preseq curves so the dir is populated
     *expand(out_path("preseq", "{sample}.lc.tsv"), sample=SAMPLES),
     *plot_targets
 ]
-if ASH_ENABLED:
-    ALL_TARGETS.append(out_path("final_qc_with_ashleys.tsv"))
-
+if SCTRIP_COUNTS_AVAILABLE:
+    ALL_TARGETS.append(SCTRIP_COUNTS_INFO_TSV)
 rule all:
     input: ALL_TARGETS
 
@@ -210,6 +384,11 @@ rule alfred_qc:
         qc=out_path("stats-by-lib", "{sample}.qc.tsv.gz")
     conda: "envs/qc_env.yaml"
     threads: 4
+    resources:
+        mem_mb=bam_resource("alfred_qc", "mem_mb"),
+        partition=bam_resource("alfred_qc", "partition"),
+        qos="normal",
+        time=bam_resource("alfred_qc", "time")
     log:
         out_path("logs", "{sample}.alfred_qc.log")
     params:
@@ -249,6 +428,7 @@ rule aggregate_alignment_metrics:
             if header and values and len(header) == len(values):
                 rec = dict(zip(header, values))
                 rec["Library"] = sample_id
+                rec["Sample"] = SAMPLE_OF.get(sample_id, rec.get("Sample", infer_sample_from_library(sample_id)))
                 records.append(rec)
             else:
                 print(f"[aggregate_alignment_metrics] Warning: could not parse 'ME' lines in {qc}")
@@ -273,45 +453,71 @@ rule make_windows:
     conda: "envs/qc_env.yaml"
     params:
         out_dir=str(OUT_ROOT),
-        window=WIN_SIZE
+        window=WIN_SIZE,
+        target_chroms=TARGET_CHROMS_STR
     shell:
-        """
+        r"""
+        set -euo pipefail
         mkdir -p {params.out_dir}
-        bedtools makewindows -g {input.fai} -w {params.window} \
+        genome="{output.bed}.genome.tmp"
+        keep="{output.bed}.keep.tmp"
+        target_chroms="{params.target_chroms}"
+
+        if [[ -n "$target_chroms" ]]; then
+          ref_has_chr=$(head -n1 {input.fai} | cut -f1 | grep -c '^chr' || true)
+          printf "%s\n" $target_chroms \
+            | awk -v ref_has_chr="$ref_has_chr" 'BEGIN{{OFS="\t"}}
+                {{ c=$1;
+                   if (ref_has_chr==1 && c !~ /^chr/) c="chr" c;
+                   else if (ref_has_chr==0 && c ~ /^chr/) sub(/^chr/,"",c);
+                   print c }}' > "$keep"
+          awk 'BEGIN{{OFS="\t"}} FNR==NR{{keep[$1]=1; next}} ($1 in keep){{print $1,$2}}' \
+            "$keep" {input.fai} > "$genome"
+        else
+          cut -f1,2 {input.fai} > "$genome"
+        fi
+
+        test -s "$genome"
+        bedtools makewindows -g "$genome" -w {params.window} \
           | bgzip -c > {output.bed}
+        rm -f "$genome" "$keep"
         """
 
 rule coverage_counts:
     input:
         bam=lambda wc: BAM_OF[wc.sample],
-        bai=lambda wc: BAM_OF[wc.sample] + ".bai",
+        bai=lambda wc: BAI_OF[wc.sample],
         win=WIN_BED_GZ
     output:
         tsv=out_path("binned", "{sample}.bins.tsv.gz")
     threads: 2
     resources:
-        mem_mb=20000,
-        partition="medium",
+        mem_mb=bam_resource("coverage_counts", "mem_mb"),
+        partition=bam_resource("coverage_counts", "partition"),
         qos="normal",
-        time="04:00:00",
+        time=bam_resource("coverage_counts", "time"),
         tmpdir=TMP_DIR
     conda: "envs/py_env.yaml"
     log:
         out_path("logs", "{sample}.coverage_counts.log")
     params:
         bins_dir=DIR_BINS,
-        log_dir=DIR_LOGS
+        log_dir=DIR_LOGS,
+        target_chroms=TARGET_CHROMS_STR
     shell:
         r"""
         set -euo pipefail
-        mkdir -p {params.bins_dir} {params.log_dir} "{resources.tmpdir}"
-
         tmpdir="{resources.tmpdir}"
+        tmpdir="${{tmpdir:-/tmp}}"
+        mkdir -p {params.bins_dir} {params.log_dir} "${{tmpdir}}"
         fprefix="{wildcards.sample}"
-        fbam="${{tmpdir}}/${{fprefix}}.chr1_22_XY.filtered.bam"
+        fbam="${{tmpdir}}/${{fprefix}}.target.filtered.bam"
         gfile="${{tmpdir}}/${{fprefix}}.genome"
-        tbed="${{tmpdir}}/${{fprefix}}.chr1_22_XY.targets.bed"
+        tgfile="${{tmpdir}}/${{fprefix}}.targets.genome"
+        tbed="${{tmpdir}}/${{fprefix}}.targets.bed"
+        hwin="${{tmpdir}}/${{fprefix}}.windows.harmonized.bed.gz"
         wbed="{input.win}"
+        target_chroms="{params.target_chroms}"
 
         # Build genome file (chrom\tlength)
         samtools view -H {input.bam} \
@@ -319,14 +525,21 @@ rule coverage_counts:
 
         bam_has_chr=$(head -n1 "${{gfile}}" | cut -f1 | grep -c '^chr' || true)
 
-        if [[ "${{bam_has_chr}}" -eq 1 ]]; then
-          keep=$(printf 'chr%s\n' $(seq 1 22) X Y)
+        if [[ -n "$target_chroms" ]]; then
+          printf "%s\n" $target_chroms \
+            | awk -v bam_has_chr="${{bam_has_chr}}" 'BEGIN{{OFS="\t"}}
+                {{ c=$1;
+                   if (bam_has_chr==1 && c !~ /^chr/) c="chr" c;
+                   else if (bam_has_chr==0 && c ~ /^chr/) sub(/^chr/,"",c);
+                   print c }}' \
+            | awk 'BEGIN{{OFS="\t"}} FNR==NR{{len[$1]=$2; next}} ($1 in len){{print $1,len[$1]}}' "${{gfile}}" - \
+            > "${{tgfile}}"
         else
-          keep=$(printf '%s\n' $(seq 1 22) X Y)
+          cp "${{gfile}}" "${{tgfile}}"
         fi
 
-        awk 'BEGIN{{OFS="\t"}} FNR==NR{{keep[$1]=1; next}} ($1 in keep){{print $1,0,$2}}' \
-          <(printf "%s\n" $keep) "${{gfile}}" > "${{tbed}}"
+        test -s "${{tgfile}}"
+        awk 'BEGIN{{OFS="\t"}} {{print $1,0,$2}}' "${{tgfile}}" > "${{tbed}}"
 
         samtools view -@ {threads} -b -F 3584 -q 10 -L "${{tbed}}" {input.bam} -o "${{fbam}}"
         samtools index -@ {threads} "${{fbam}}"
@@ -337,20 +550,20 @@ rule coverage_counts:
                    if (bam_has_chr==1 && c !~ /^chr/) c="chr" c;
                    else if (bam_has_chr==0 && c ~ /^chr/) sub(/^chr/,"",c);
                    print c,s,e }}' \
-          | awk 'BEGIN{{OFS="\t"}} FNR==NR{{len[$1]=$2; next}} ($1 in len){{print $0}}' "${{gfile}}" - \
-          | bedtools sort -g "${{gfile}}" -i - \
-          | bgzip -c > "${{wbed}}.harmonized.{wildcards.sample}.bed.gz"
+          | awk 'BEGIN{{OFS="\t"}} FNR==NR{{len[$1]=$2; next}} ($1 in len){{print $0}}' "${{tgfile}}" - \
+          | bedtools sort -g "${{tgfile}}" -i - \
+          | bgzip -c > "${{hwin}}"
 
         bedtools coverage \
           -sorted \
-          -g "${{gfile}}" \
-          -a "${{wbed}}.harmonized.{wildcards.sample}.bed.gz" \
+          -g "${{tgfile}}" \
+          -a "${{hwin}}" \
           -b "${{fbam}}" \
           -counts \
           2>> {log} \
           | bgzip -c > {output.tsv}
 
-        rm -f "${{fbam}}" "${{fbam}}.bai" "${{wbed}}.harmonized.{wildcards.sample}.bed.gz" "${{tbed}}" "${{gfile}}"
+        rm -f "${{fbam}}" "${{fbam}}.bai" "${{hwin}}" "${{tbed}}" "${{gfile}}" "${{tgfile}}"
         """
 
 rule windows_gc:
@@ -379,15 +592,15 @@ rule windows_gc:
 rule preseq_lc:
     input:
         bam=lambda wc: BAM_OF[wc.sample],
-        bai=lambda wc: BAM_OF[wc.sample] + ".bai"
+        bai=lambda wc: BAI_OF[wc.sample]
     output:
         tsv=out_path("preseq", "{sample}.lc.tsv")
     threads: 4
     resources:
-        mem_mb=8000,
-        partition="short",
+        mem_mb=bam_resource("preseq_lc", "mem_mb"),
+        partition=bam_resource("preseq_lc", "partition"),
         qos="normal",
-        time="01:30:00",
+        time=bam_resource("preseq_lc", "time"),
         tmpdir=TMP_DIR
     conda: "envs/preseq.yaml"
     log:
@@ -403,8 +616,10 @@ rule preseq_lc:
         set +o pipefail
         set -u
 
-        mkdir -p {params.preseq_dir} {params.log_dir} {resources.tmpdir}
-        wdir="{resources.tmpdir}/{wildcards.sample}.preseq"
+        tmpdir="{resources.tmpdir}"
+        tmpdir="${{tmpdir:-/tmp}}"
+        mkdir -p {params.preseq_dir} {params.log_dir} "${{tmpdir}}"
+        wdir="${{tmpdir}}/{wildcards.sample}.preseq"
         mkdir -p "${{wdir}}"
         pbam="${{wdir}}/1.primary.bam"
         nbam="${{wdir}}/2.namesort.bam"
@@ -483,17 +698,45 @@ rule qc_from_counts:
           --counts {input.tsv} \
           --sample {wildcards.sample} \
           --gc-table {input.gc} \
-          --alfred-summary {input.alfred} \
           --preseq {input.preseq} \
           --out {output.qc} > {log} 2>&1
         """
 
-rule make_sample_final_qc:
+rule aggregate_sctrip_counts_info:
+    input:
+        counts=SCTRIP_COUNTS_INFO_FILES,
+        libmap=LIBMAP_TSV
+    output:
+        counts=SCTRIP_COUNTS_INFO_TSV
+    threads: 1
+    resources:
+        mem_mb=4000,
+        partition="short",
+        qos="normal",
+        time="00:20:00"
+    conda: "envs/py_env.yaml"
+    log:
+        out_path("logs", "aggregate_sctrip_counts_info.log")
+    params:
+        bam_ext=BAM_EXT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log})" "$(dirname {output.counts})"
+        python -u workflow/scripts/aggregate_sctrip_counts_info.py \
+          --libmap {input.libmap} \
+          --bam-ext "{params.bam_ext}" \
+          --out {output.counts} \
+          {input.counts} > {log} 2>&1
+        """
+
+rule make_core_qc:
     input:
         alfred=out_path("alignment_summary_metrics.tsv"),
-        qc2=expand(out_path("qc-from-bins", "{sample}.counts_qc.tsv"), sample=SAMPLES)
+        qc2=expand(out_path("qc-from-bins", "{sample}.counts_qc.tsv"), sample=SAMPLES),
+        sctrip=SCTRIP_COUNTS_INFO_TSV if SCTRIP_COUNTS_AVAILABLE else []
     output:
-        final=out_path("final_qc.tsv")
+        final=CORE_QC_TSV
     threads: 2
     resources:
         mem_mb=20000,
@@ -599,7 +842,7 @@ rule make_sample_final_qc:
 
         # Ensure keys exist
         if "Library" not in dfA.columns:
-            raise ValueError("[make_sample_final_qc] alignment_summary_metrics.tsv lacks 'Library'")
+            raise ValueError("[make_core_qc] alignment_summary_metrics.tsv lacks 'Library'")
         if "Sample" not in dfA.columns:
             # If Sample ever disappears from Alfred ME extraction, keep pipeline alive
             dfA["Sample"] = dfA["Library"].astype(str).str.replace(r"_A\d+_L\d+_i\d+.*$", "", regex=True)
@@ -641,6 +884,22 @@ rule make_sample_final_qc:
         # Merge
         merged = dfA.merge(dfQ, on="Library", how="left")
 
+        def input_paths(x):
+            if x is None:
+                return []
+            if isinstance(x, str):
+                return [x] if x else []
+            return [str(v) for v in x if str(v)]
+
+        sctrip_paths = input_paths(getattr(input, "sctrip", []))
+        if sctrip_paths and os.path.exists(sctrip_paths[0]) and os.path.getsize(sctrip_paths[0]) > 0:
+            dfS = pd.read_csv(sctrip_paths[0], sep="\t")
+            if "Library" not in dfS.columns:
+                raise ValueError("[make_core_qc] sctrip_counts_info.tsv lacks 'Library'")
+            valid = dfS["Library"].notna() & (dfS["Library"].astype(str).str.len() > 0)
+            dfS = dfS.loc[valid].drop_duplicates(subset=["Library"], keep="first")
+            merged = merged.merge(dfS, on="Library", how="left")
+
         # Column order: IDs first
         id_cols = ["Library", "Sample"]
         other_cols = [c for c in merged.columns if c not in id_cols]
@@ -659,7 +918,7 @@ rule make_sample_final_qc:
 # --------------------------- OPTIONAL PLOTTING -------------------------------
 rule plot_qc:
     input:
-        final=out_path("final_qc.tsv"),
+        final=FINAL_QC_TSV,
         preseq=lambda wc: out_path("preseq", wc.sample + ".lc.tsv")
     output:
         pdf=out_path("plots", "per-lib-qc", "{sample}.qc.pdf")
@@ -679,11 +938,13 @@ rule plot_qc:
     shell:
         r"""
         set -euo pipefail
-        mkdir -p {params.plots_dir} $(dirname {log}) "{resources.tmpdir}"
+        tmpdir="{resources.tmpdir}"
+        tmpdir="${{tmpdir:-/tmp}}"
+        mkdir -p {params.plots_dir} $(dirname {log}) "${{tmpdir}}"
 
         # Headless + safe font cache
         export MPLBACKEND=Agg
-        export MPLCONFIGDIR="{resources.tmpdir}/{wildcards.sample}.mplcfg"
+        export MPLCONFIGDIR="${{tmpdir}}/{wildcards.sample}.mplcfg"
         mkdir -p "$MPLCONFIGDIR"
 
         # Optional: avoids numba trying to JIT on some clusters
@@ -698,7 +959,7 @@ rule plot_qc:
 
 rule plot_run_summary_R:
     input:
-        final=out_path("final_qc.tsv")
+        final=FINAL_QC_TSV
     output:
         pdf=out_path("plots", "run_summary.pdf")
     threads: 1
@@ -711,7 +972,7 @@ rule plot_run_summary_R:
     log:
         out_path("logs", "run_summary_R.log")
     params:
-        count_col="total.read.count"
+        count_col="bin_total_read_count"
     shell:
         r"""
         mkdir -p "$(dirname {log})" "$(dirname {output.pdf})"
@@ -733,11 +994,18 @@ rule write_library_map:
         rows = []
         for lib, bam in BAM_OF.items():
             cell = os.path.basename(bam)  # e.g. A5455_L2_1001.sort.mdup.bam
-            rows.append({"cell": cell, "Library": lib})
+            rows.append({
+                "cell": cell,
+                "bam": bam,
+                "Sample": SAMPLE_OF.get(lib, infer_sample_from_library(lib)),
+                "Library": lib,
+            })
         pd.DataFrame(rows).to_csv(output[0], sep="\t", index=False)
 
-# Merge existing Ashley features or compute them; then normalize to Library
+# Merge existing Ashley features or compute them when Ashley computation is enabled.
 rule ashleys_labels_or_features:
+    input:
+        source=ASH_FEATURE_SOURCE_FILES
     output:
         features = ASH_FEATURES
     threads: ASH.get("threads", 32)
@@ -746,54 +1014,51 @@ rule ashleys_labels_or_features:
         partition = "highmem",
         qos = "normal",
         time = "1-00:00:00"
-    conda: ASH.get("conda_env", "envs/ashleys.yaml")
+    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_NEEDS_FEATURE_RUN else "envs/py_env.yaml"
     log:
         out_path("ashleys", "logs", "features_or_labels.log")
     params:
-        folder   = str(DATA_ROOT),
-        windows  = ash_win_str(),
-        extension= BAM_EXT,
-        bin      = ASH.get("bin", ASH_DEFAULT["bin"])
+        folder=str(DATA_ROOT),
+        windows=ash_win_str(),
+        extension=BAM_EXT,
+        bin=ASH.get("bin", ASH_DEFAULT["bin"]),
+        source_count=len(ASH_FEATURE_SOURCE_FILES),
+        enabled=ASH_ENABLED
     shell:
         r"""
         set -euo pipefail
         mkdir -p "$(dirname {log})" "$(dirname {output.features})"
 
-        RUN_DIR="{config[data_location]}"
-        MODE="FLAT"
-        if find "$RUN_DIR" -mindepth 2 -maxdepth 2 -type d -name bam -print -quit | grep -q .; then
-          MODE="HIER"
-        fi
-
-        # Prefer merging any precomputed features if present
-        if [[ "$MODE" == "HIER" ]] && \
-           find "$RUN_DIR" -type f \( -path '*/predictions/ashleys_features.tsv' -o -path '*/prediction/ashleys_features.tsv' -o -path '*/predicitons/ashleys_features.tsv' \) -print -quit | grep -q .; then
-
+        if [[ {params.source_count} -gt 0 ]]; then
           TMP="{output.features}.tmp"
-          find "$RUN_DIR" -type f \
-            \( -path '*/predictions/ashleys_features.tsv' -o -path '*/prediction/ashleys_features.tsv' -o -path '*/predicitons/ashleys_features.tsv' \) \
-            -print | sort \
-            | xargs awk 'FNR==1 && NR>1 {{next}} {{print}}' > "$TMP"
-
+          awk 'FNR==1 && NR>1 {{next}} {{print}}' {input.source} > "$TMP"
           test -s "$TMP"
           mv -f "$TMP" "{output.features}"
-        else
-          # Compute features from BAMs
-          python -u "{params.bin}" -j {threads} features \
-            -f "{params.folder}" \
-            -w {params.windows} \
-            -o "{output.features}" \
-            --recursive_collect \
-            -e "{params.extension}" >> "{log}" 2>&1
-
-          test -s "{output.features}"
+          exit 0
         fi
+
+        if [[ "{params.enabled}" != "True" ]]; then
+          echo "[ashleys_features] No existing Ashley feature table found and ashleys.enabled is false." > "{log}"
+          exit 1
+        fi
+
+        ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
+        export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
+        python -u "{params.bin}" -j {threads} features \
+          -f "{params.folder}" \
+          -w {params.windows} \
+          -o "{output.features}" \
+          --recursive_collect \
+          -e "{params.extension}" >> "{log}" 2>&1
+
+        test -s "{output.features}"
         """
 
-# Merge labels (if any) or predict from features, then normalize to Library
+# Merge existing labels/predictions or predict from features when Ashley computation is enabled.
 rule ashleys_predict_or_copy:
     input:
-        features = rules.ashleys_labels_or_features.output.features
+        source=ASH_PRED_SOURCE_FILES,
+        features=ASH_FEATURES if ASH_ENABLED and len(ASH_PRED_SOURCE_FILES) == 0 else []
     output:
         pred_dir = directory(ASH_PRED_DIR),
         pred     = ASH_PRED_TSV
@@ -803,69 +1068,85 @@ rule ashleys_predict_or_copy:
         partition = "medium",
         qos = "normal",
         time = "04:00:00"
-    conda: ASH.get("conda_env", "envs/ashleys.yaml")
+    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_NEEDS_PRED_RUN else "envs/py_env.yaml"
     log:
         out_path("ashleys", "logs", "predict_or_copy.log")
     params:
-        bin   = ASH.get("bin", ASH_DEFAULT["bin"]),
-        model = ASH.get("model_path", ASH_DEFAULT["model_path"])
+        bin=ASH.get("bin", ASH_DEFAULT["bin"]),
+        model=ASH.get("model_path", ASH_DEFAULT["model_path"]),
+        source_count=len(ASH_PRED_SOURCE_FILES),
+        enabled=ASH_ENABLED
     shell:
         r"""
         set -euo pipefail
-        RUN_DIR="{config[data_location]}"
         mkdir -p "{output.pred_dir}" "$(dirname {log})"
 
-        # Try to merge any labels.tsv produced by upstream tools
-        if find "$RUN_DIR" -type f \
-             \( -path '*/cell_selection/labels.tsv' -o -path '*/predictions/labels.tsv' -o -path '*/prediction/labels.tsv' \) \
-             -print -quit | grep -q .; then
-
+        if [[ {params.source_count} -gt 0 ]]; then
           TMP="{output.pred}.tmp"
-          find "$RUN_DIR" -type f \
-            \( -path '*/cell_selection/labels.tsv' -o -path '*/predictions/labels.tsv' -o -path '*/prediction/labels.tsv' \) \
-            -print | sort \
-            | xargs awk 'FNR==1 && NR>1 {{next}} {{print}}' > "$TMP"
-
+          awk 'FNR==1 && NR>1 {{next}} {{print}}' {input.source} > "$TMP"
           test -s "$TMP"
           mv -f "$TMP" "{output.pred}"
           exit 0
         fi
 
-        # Fallback: run predict from features.tsv
+        if [[ "{params.enabled}" != "True" ]]; then
+          echo "[ashleys_predict_or_copy] No existing Ashley prediction table found and ashleys.enabled is false." > "{log}"
+          exit 1
+        fi
+
+        ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
+        export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
         python -u "{params.bin}" -j {threads} predict \
           -p "{input.features}" \
           -o "{output.pred_dir}" \
-          -m "{params.model}"
+          -m "{params.model}" \
+          >> "{log}" 2>&1
 
         test -s "{output.pred}"
         """
 
+if ASH_MERGE_ENABLED:
+    rule finalize_qc:
+        input:
+            core=CORE_QC_TSV,
+            pred=ASH_PRED_TSV,
+            feat=ASH_FEATURES if ASH_FEATURES_AVAILABLE else []
+        output:
+            final=FINAL_QC_TSV
+        log:
+            out_path("logs", "final_qc.log")
+        conda:
+            "envs/R_merge.yaml"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {log})" "$(dirname {output.final})"
 
-# Final merge (R) with normalized Ashley tables; copy to results/
-rule merge_final_qc_with_ashleys:
-    input:
-        final = out_path("final_qc.tsv"),
-        pred  = out_path("ashleys/prediction/prediction.tsv"),
-        feat  = out_path("ashleys/features.tsv")
-    output:
-        merged = out_path("final_qc_with_ashleys.tsv")
-    log:
-        out_path("logs/merge_final_qc_with_ashleys.log")
-    conda:
-        "envs/R_merge.yaml"
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p "$(dirname {log})" "$(dirname {output.merged})"
+            FEAT_ARG=""
+            if [[ -n "{input.feat}" ]] && [[ -s "{input.feat}" ]]; then
+              FEAT_ARG="--feat {input.feat}"
+            fi
 
-        FEAT_ARG=""
-        [[ -s "{input.feat}" ]] && FEAT_ARG="--feat {input.feat}"
-
-        # Write directly to the declared output path; no copies afterwards.
-        Rscript workflow/scripts/merge_ashleys.R \
-          --final "{input.final}" \
-          --pred  "{input.pred}" \
-          ${{FEAT_ARG}} \
-          --out  "{output.merged}" \
-          > "{log}" 2>&1
-        """
+            Rscript workflow/scripts/merge_ashleys.R \
+              --final "{input.core}" \
+              --pred  "{input.pred}" \
+              ${{FEAT_ARG}} \
+              --out  "{output.final}" \
+              > "{log}" 2>&1
+            """
+else:
+    rule finalize_qc:
+        input:
+            core=CORE_QC_TSV
+        output:
+            final=FINAL_QC_TSV
+        log:
+            out_path("logs", "final_qc.log")
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {log})" "$(dirname {output.final})"
+            cp "{input.core}" "{output.final}.tmp"
+            mv -f "{output.final}.tmp" "{output.final}"
+            echo "[finalize_qc] Ashley merge disabled or unavailable; wrote core QC to {output.final}" > "{log}"
+            """

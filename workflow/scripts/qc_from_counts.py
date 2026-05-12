@@ -120,7 +120,6 @@ def main():
     ap.add_argument("--pct-thresholds", default="1,10,30")
     # Optional extras (used if provided)
     ap.add_argument("--gc-table", help="TSV with GC per window (e.g. bedtools nuc). Must align with the same windows; can be merged via chrom/start/end if present.")
-    ap.add_argument("--alfred-summary", help="alignment_summary_metrics.tsv to extract MedianInsertSize / MedianMAPQ for this Library")
     ap.add_argument("--preseq", help="preseq lc_extrap output for this Library (optional complexity metrics)")
     args = ap.parse_args()
 
@@ -156,8 +155,16 @@ def main():
         # Merge if keys present, else assume same order
         if set(["chrom","start","end"]).issubset(gc_df.columns) and set(["chrom","start","end"]).issubset(df.columns):
             m = pd.merge(df[["chrom","start","end","counts"]], gc_df, on=["chrom","start","end"], how="inner")
-            y = m["counts"].astype(float).values
-            x = m["gc"].astype(float).values
+            if m.shape[0] > 0:
+                y = m["counts"].astype(float).values
+                x = m["gc"].astype(float).values
+            elif gc_df.shape[0] == df.shape[0]:
+                # Chromosome prefixes can differ after BAM/reference harmonization.
+                # The workflow preserves window order, so row order is a safe fallback.
+                y = counts
+                x = gc_df["gc"].astype(float).values
+            else:
+                raise ValueError("GC table keys do not match counts table and row counts differ.")
         else:
             # same row order
             if gc_df.shape[0] != df.shape[0]:
@@ -172,57 +179,42 @@ def main():
         if mask.sum() > 2:
             gc_r = float(np.corrcoef(x[mask], y[mask])[0,1])
 
-    # Optional: Alfred summary for insert-size / MAPQ
-    median_insert_size = np.nan
-    median_mapq = np.nan
-    if args.alfred_summary and os.path.exists(args.alfred_summary):
-        try:
-            asdf = pd.read_csv(args.alfred_summary, sep="\t")
-            row = asdf.loc[asdf["Library"] == args.sample]
-            if len(row) > 0:
-                # Column names from your Alfred summary (case-sensitive)
-                if "MedianInsertSize" in row:
-                    median_insert_size = float(row["MedianInsertSize"].values[0])
-                elif "MedianInsertSize" in asdf.columns:
-                    median_insert_size = float(row["MedianInsertSize"].values[0])
-                # MedianMAPQ
-                if "MedianMAPQ" in asdf.columns:
-                    median_mapq = float(row["MedianMAPQ"].values[0])
-        except Exception as e:
-            print(f"[qc_from_counts] Warning reading {args.alfred_summary}: {e}", file=sys.stderr)
-
-    # Optional: preseq complexity (crude extraction)
+    # Optional: preseq complexity.
     complexity_at_observed = np.nan
     complexity_saturation  = np.nan
+    preseq_status = "missing"
     if args.preseq and os.path.exists(args.preseq):
         try:
-            # Try to read headered preseq files first
             p_df = pd.read_csv(args.preseq, sep="\t", comment="#")
             if {"TOTAL_READS", "EXPECTED_DISTINCT"}.issubset(set(p_df.columns)):
                 total_col = "TOTAL_READS"
                 distinct_col = "EXPECTED_DISTINCT"
-                # use the row nearest to observed total if possible (but we don't have observed reads here)
-                last = p_df.loc[~p_df[total_col].isna()].iloc[-1]
-                tot = float(last[total_col])
-                distinct = float(last[distinct_col])
+                numeric = p_df[[total_col, distinct_col]].apply(pd.to_numeric, errors="coerce").dropna()
+            else:
+                p_df2 = pd.read_csv(args.preseq, sep="\t", comment="#", header=None)
+                if p_df2.shape[1] >= 2:
+                    numeric = p_df2.iloc[:, [0, 1]].apply(pd.to_numeric, errors="coerce").dropna()
+                    numeric.columns = ["TOTAL_READS", "EXPECTED_DISTINCT"]
+                    total_col = "TOTAL_READS"
+                    distinct_col = "EXPECTED_DISTINCT"
+                else:
+                    numeric = pd.DataFrame(columns=["TOTAL_READS", "EXPECTED_DISTINCT"])
+
+            if numeric.empty:
+                preseq_status = "empty"
+            else:
+                idx = (numeric[total_col].astype(float) - total).abs().idxmin()
+                row = numeric.loc[idx]
+                tot = float(row[total_col])
+                distinct = float(row[distinct_col])
                 if tot > 0:
                     complexity_at_observed = distinct
-                    complexity_saturation  = distinct / tot
-            else:
-                # fallback: headerless two-column file (total, distinct)
-                p_df2 = pd.read_csv(args.preseq, sep="\t", comment="#", header=None)
-                # require at least 2 columns and some numeric data
-                if p_df2.shape[1] >= 2:
-                    # take last row with numeric values
-                    numeric_rows = p_df2.applymap(lambda x: pd.to_numeric(x, errors="coerce")).dropna(how='all')
-                    if numeric_rows.shape[0] > 0:
-                        last = numeric_rows.iloc[-1]
-                        tot = float(last.iloc[0])
-                        distinct = float(last.iloc[1])
-                        if tot > 0:
-                            complexity_at_observed = distinct
-                            complexity_saturation  = distinct / tot
+                    complexity_saturation = distinct / tot
+                    preseq_status = "ok"
+                else:
+                    preseq_status = "stub"
         except Exception as e:
+            preseq_status = "error"
             print(f"[qc_from_counts] Warning reading preseq file {args.preseq}: {e}", file=sys.stderr)
 
 
@@ -243,6 +235,7 @@ def main():
         "gc_pearson_r": gc_r,
         "preseq_distinct_at_observed": complexity_at_observed,
         "preseq_saturation": complexity_saturation,
+        "preseq_curve_status": preseq_status,
     }
     out.update(pct_metrics)
 

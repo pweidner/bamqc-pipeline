@@ -17,8 +17,8 @@ default-resources:
 #  - mem_mb=2000
   - time="00:30:00"
 set-resources:
-  - ashleys_features:partition=medium
-  - ashleys_features:time=1-00:00:00
+  - ashleys_labels_or_features:partition=medium
+  - ashleys_labels_or_features:time=1-00:00:00
   - aggregate_alignment_metrics:mem_mb=56000
 max-jobs-per-second: 100
 max-status-checks-per-second: 100

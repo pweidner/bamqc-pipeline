@@ -1,4 +1,4 @@
-# BamQC-pipeline 🚀
+# bamqc-pipeline 🚀
 
 A fast, reproducible **Snakemake** workflow for **QC of BAMs** — alignment stats, binned-coverage metrics, library complexity, and optional **Ashley’s QC**.
 
@@ -14,11 +14,12 @@ A fast, reproducible **Snakemake** workflow for **QC of BAMs** — alignment sta
 
 ## ⚙️ 1. Installation
 
-Clone the repos into your work folder (note that the pipeline needs ashleys-qc repo as well):
+Clone the repos into a work folder without spaces in the path. Ashley QC is only needed when `ashleys.enabled: true` and existing Ashley outputs are not already present.
 
 ```bash
 cd
-cd work/
+mkdir -p work
+cd work
 git clone https://github.com/pweidner/bamqc-pipeline.git
 git clone https://github.com/friendsofstrandseq/ashleys-qc.git
 cd bamqc-pipeline
@@ -36,16 +37,23 @@ conda activate snakemake
 
 ## 🧾 2. Configuration (`config/config.yaml`)
 
+For cluster work, keep tracked defaults in `config/config.yaml` and put
+machine- or run-specific overrides in ignored `config/config.local.yaml`.
+If `config/config.local.yaml` exists, it is loaded automatically on top of the
+tracked config.
+
 ```yaml
 ref: hg38
 reference_path: /ref/dir               # contains hg38.fa (+.fai)
 data_location:  /path/to/input         # FLAT: *.sort.mdup.bam; HIER: <sample>/bam/*.sort.mdup.bam
 output_location: /path/to/output
 window: 200000
+chromosomes: "1-22,X,Y"                # or "all" for every reference contig
 plot: true
 
 bam_ext: ".sort.mdup.bam"
 tmp_dir: /tmp
+large_bam_threshold_mb: 800
 
 ashleys:
   enabled: true
@@ -57,17 +65,25 @@ ashleys:
   conda_env: envs/ashleys.yaml
 ```
 
+**Large BAM resource selection**
+
+BAM-dependent jobs use `large_bam_threshold_mb` to choose between the configured `small` and `large` resource profiles. The default threshold is 800 MB and applies to `alfred_qc`, `coverage_counts`, and `preseq_lc`.
+
 **Discovery modes (note you can adjust bam_ext: ".sort.mdup.bam" in the config)**
 - **FLAT**: `data_location/*.sort.mdup.bam`
 - **HIER**: `data_location/<SAMPLE>/bam/*.sort.mdup.bam`  
-  → auto-detected.
+  → auto-detected. If present, `data_location/<SAMPLE>/counts/*.info_raw`
+  files are aggregated into scTRIP QC metrics; older `*.info` files are used
+  only when no raw table exists for that sample.
 
 ---
 
 ## ▶️ 3. Run
 
 ```bash
-snakemake --config data_location=/data/runA output_location=/data/runA/bamqc --profile workflow/profiles --keep-going
+cp config/config.local.example.yaml config/config.local.yaml
+# edit config/config.local.yaml for the run
+snakemake --profile workflow/profiles --keep-going
 ```
 
 ---
@@ -76,12 +92,9 @@ snakemake --config data_location=/data/runA output_location=/data/runA/bamqc --p
 
 ```
 output_location/
-├── final_qc.tsv                         # 🧩 Alfred + counts-based + counts.info + preseq QC + Ashley’s columns
-│
-├── results/                             # 📊 Per tool deliverables
-│   ├── final_qc.tsv
-│   ├── preseq_metrics.tsv               # Preseq summary stats across libraries
-│   └── alignment_summary_metrics.tsv    # Alfred summary across libraries
+├── final_qc.tsv                         # 🧩 single final table; Ashley columns included when available
+├── alignment_summary_metrics.tsv        # parsed Alfred summary across libraries
+├── sctrip_counts_info.tsv               # optional HIER counts/*.info_raw or counts/*.info aggregation
 │
 ├── metadata/
 │   └── library_map.tsv                  # cell <-> Library mapping for sanity checks
@@ -100,10 +113,8 @@ output_location/
 │
 ├── ashleys/
 │   ├── features.tsv                     # merged/computed Ashley features
-│   ├── features.norm.tsv                # features keyed by Library
 │   └── prediction/
-│       ├── prediction.tsv               # merged labels or predictions
-│       └── prediction.norm.tsv          # normalized to Library
+│       └── prediction.tsv               # merged labels or predictions
 │
 └── plots/
     ├── per-lib-qc/{Library}.qc.pdf      # optional per-lib PDF
@@ -112,10 +123,10 @@ output_location/
 
 ## 🧬 Output metrics (what they mean + how to read them)
 
-This pipeline produces per-library QC summaries in two main tables:
+This pipeline produces per-library QC summaries in these primary tables:
 
-- **`final_qc.tsv`** — core QC metrics derived from **Alfred**, **bin-wise coverage**, and **preseq**
-- **`final_qc_with_ashleys.tsv`** — `final_qc.tsv` plus **Ashley’s QC predictions** and **Ashley feature vectors**
+- **`final_qc.tsv`** — the single final QC table. It always includes core **Alfred**, **bin-wise coverage**, and **preseq** metrics; adds optional HIER **scTRIP/mosaicatcher counts info**; and adds `ash_*` columns when Ashley outputs are available or Ashley computation is enabled.
+- **`sctrip_counts_info.tsv`** — optional run-level aggregation of HIER `counts/*.info_raw` tables, falling back to `counts/*.info` when raw tables are absent.
 
 All non-identifier columns are prefixed by their producing tool to make provenance explicit.
 
@@ -251,6 +262,7 @@ Derived from **`preseq lc_extrap`**, estimating how many *unique* DNA fragments 
 |------|--------|----------------|
 | `preseq_distinct_at_observed` | Expected number of distinct fragments at observed depth | Higher = more complex library. |
 | `preseq_saturation` | Distinct / total reads at observed depth | **0 = highly duplicated**, **1 = highly complex**. |
+| `preseq_curve_status` | Whether the preseq curve was parsed as `ok`, `missing`, `empty`, `stub`, or `error`. | Non-`ok` values should be checked in logs. |
 
 **Rule of thumb**
 - `preseq_saturation ≈ 1` → sequencing deeper will still yield new information  
@@ -258,9 +270,30 @@ Derived from **`preseq lc_extrap`**, estimating how many *unique* DNA fragments 
 
 ---
 
-## 5️⃣ Ashley QC predictions (`ash_*`)
+## 5️⃣ scTRIP / mosaicatcher counts info (`sctrip_*`)
 
-Generated by **ashleys-qc**, integrating coverage patterns and strand balance.
+Available in HIER mode when per-sample `counts/*.info_raw` or `counts/*.info` files exist. Raw tables are preferred because they retain all cells.
+
+| Column | Meaning | Interpretation |
+|------|--------|----------------|
+| `sctrip_sample` | mosaicatcher sample label from the counts info table | Should match `Sample`. |
+| `sctrip_cell` | Cell/library name from the counts info table | Used with `Sample`/BAM path to join into `Library`. |
+| `sctrip_mapped` | Total reads seen by scTRIP/mosaicatcher counting | Global input depth before filters. |
+| `sctrip_suppl` | Supplementary, secondary, or QC-failed reads filtered out | High values suggest alignment artifacts or poor read quality. |
+| `sctrip_dupl` | PCR duplicate reads filtered out | High values indicate low library complexity. |
+| `sctrip_mapq` | Reads filtered out for low mapping quality | High values suggest ambiguous mapping. |
+| `sctrip_read2` | Read 2 records filtered out by the counter | Expected for read-1-oriented counting logic. |
+| `sctrip_good` | Reads used for counting | Useful direct comparison to BamQC `bin_total_read_count`. |
+| `sctrip_pass1` | mosaicatcher coverage pass flag | `0` means downstream NB fields should be treated cautiously. |
+| `sctrip_nb_p`, `sctrip_nb_r`, `sctrip_nb_a` | Negative-binomial parameters estimated by mosaicatcher | Present mainly for compatibility and deeper troubleshooting. |
+| `sctrip_bam` | BAM path recorded in the counts info table | Helps audit joins. |
+| `sctrip_counts_info_path` | Source `*.info_raw` or `*.info` file | Helps trace run-level aggregation. |
+
+---
+
+## 6️⃣ Ashley QC predictions (`ash_*`)
+
+Merged from existing Ashley labels/predictions when present. If `ashleys.enabled: true` and labels/predictions are missing, they are generated with **ashleys-qc**. If `ashleys.enabled: false`, missing Ashley predictions are not generated.
 
 | Column | Meaning | Interpretation |
 |------|--------|----------------|
@@ -271,7 +304,7 @@ Generated by **ashleys-qc**, integrating coverage patterns and strand balance.
 
 ---
 
-## 6️⃣ Ashley feature vectors (`ash_*`)
+## 7️⃣ Ashley feature vectors (`ash_*`)
 
 Multi-scale **Watson-strand bin features** and read category fractions.
 
@@ -308,6 +341,7 @@ For each window size (`5mb`, `2mb`, `1mb`, `0_8mb`, `0_6mb`, `0_4mb`, `0_2mb`):
 - **Uneven coverage** → high `bin_spikiness`, `bin_gini`, `bin_fold80`
 - **GC bias** → large `|bin_gc_r|`
 - **Mapping problems** → low `alf_mapped_frac`, low `alf_mapq_med`
+- **scTRIP count failure** → `sctrip_pass1 == 0` or very low `sctrip_good` → inspect mosaicatcher counts logs
 - **Ashley disagreement** → `ash_prob low` → inspect manually
 
 ---
@@ -318,8 +352,8 @@ For each window size (`5mb`, `2mb`, `1mb`, `0_8mb`, `0_6mb`, `0_4mb`, `0_2mb`):
 - **Entropy** and **spikiness** reflect coverage evenness (low entropy or high spikiness = uneven).
 - **Fold80 penalty** follows the Picard metric (ideal = 1, higher = less uniform).
 - **Preseq** metrics allow extrapolation of unique reads vs sequencing depth.
+- **scTRIP/mosaicatcher counts info** is included only for HIER runs that contain per-sample `counts/*.info_raw` or fallback `counts/*.info` tables.
 - **Ashley’s QC** integrates pretrained classification of Strand-seq libraries by coverage pattern and W→C balance.
-- **Mosaicatcher** fractions (`p_good`, etc.) summarize the final usable subset for downstream analyses like count plots and phasing.
 
 ---
 
