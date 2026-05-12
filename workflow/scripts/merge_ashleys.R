@@ -90,7 +90,7 @@ ap <- argparse::ArgumentParser(description = "Merge final QC with Ashley predict
 ap$add_argument("--final", required = TRUE, help = "Path to final_qc.tsv")
 ap$add_argument("--pred",  required = TRUE, help = "Path to ashleys/prediction/prediction.tsv")
 ap$add_argument("--feat",  required = FALSE, default = NULL, help = "Optional path to ashleys/features.tsv")
-ap$add_argument("--out",   required = TRUE, help = "Output: final_qc_with_ashleys.tsv")
+ap$add_argument("--out",   required = TRUE, help = "Output: final_qc.tsv")
 args <- ap$parse_args()
 
 final_path <- normalizePath(args$final, mustWork = TRUE)

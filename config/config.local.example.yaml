@@ -13,6 +13,19 @@ chromosomes: "1-22,X,Y"  # use "all" for every contig in the reference FASTA ind
 bam_ext: ".sort.mdup.bam"
 tmp_dir: "/tmp"
 
+# BAM-dependent job resources use this threshold for small/large profiles.
+large_bam_threshold_mb: 800
+bam_resources:
+  alfred_qc:
+    small: {partition: short, mem_mb: 8000, time: "01:00:00"}
+    large: {partition: medium, mem_mb: 16000, time: "1-00:00:00"}
+  coverage_counts:
+    small: {partition: short, mem_mb: 12000, time: "01:00:00"}
+    large: {partition: medium, mem_mb: 32000, time: "1-00:00:00"}
+  preseq_lc:
+    small: {partition: short, mem_mb: 8000, time: "01:00:00"}
+    large: {partition: medium, mem_mb: 16000, time: "1-00:00:00"}
+
 # Plots
 plot: false
 

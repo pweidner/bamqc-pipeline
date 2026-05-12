@@ -196,12 +196,54 @@ def discover_sctrip_counts_info(root: Path, mode: str):
         paths.extend(str(p.resolve()) for p in (raw if raw else fallback))
     return paths
 
+def discover_ashley_tables(root: Path, mode: str, kind: str):
+    """Find existing Ashley tables without recursively scanning the whole run."""
+    if not root.exists():
+        return []
+    if kind == "features":
+        rels = [
+            Path("predictions/ashleys_features.tsv"),
+            Path("prediction/ashleys_features.tsv"),
+            Path("predicitons/ashleys_features.tsv"),
+        ]
+    elif kind == "predictions":
+        rels = [
+            Path("cell_selection/labels.tsv"),
+            Path("predictions/labels.tsv"),
+            Path("prediction/labels.tsv"),
+            Path("predicitons/labels.tsv"),
+            Path("predictions/prediction.tsv"),
+            Path("prediction/prediction.tsv"),
+            Path("predicitons/prediction.tsv"),
+        ]
+    else:
+        raise ValueError("unknown Ashley table kind: " + str(kind))
+
+    roots = sorted(p for p in root.iterdir() if p.is_dir()) if mode == "HIER" else [root]
+    paths = []
+    seen = set()
+    for base in roots:
+        for rel in rels:
+            path = base / rel
+            if path.is_file():
+                resolved = str(path.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    paths.append(resolved)
+    return paths
+
 MODE, BAM_OF, SAMPLE_OF = discover_bams(DATA_ROOT, BAM_EXT)
 SAMPLES = sorted(BAM_OF.keys())
 if not SAMPLES:
     raise ValueError("[CONFIG ERROR] no BAM files discovered. Check data_location and bam_ext.")
 SCTRIP_COUNTS_INFO_FILES = discover_sctrip_counts_info(DATA_ROOT, MODE)
 SCTRIP_COUNTS_AVAILABLE = len(SCTRIP_COUNTS_INFO_FILES) > 0
+ASH_FEATURE_SOURCE_FILES = discover_ashley_tables(DATA_ROOT, MODE, "features")
+ASH_PRED_SOURCE_FILES = discover_ashley_tables(DATA_ROOT, MODE, "predictions")
+ASH_NEEDS_FEATURE_RUN = ASH_ENABLED and len(ASH_FEATURE_SOURCE_FILES) == 0
+ASH_NEEDS_PRED_RUN = ASH_ENABLED and len(ASH_PRED_SOURCE_FILES) == 0
+ASH_MERGE_ENABLED = ASH_ENABLED or len(ASH_PRED_SOURCE_FILES) > 0
+ASH_FEATURES_AVAILABLE = ASH_ENABLED or len(ASH_FEATURE_SOURCE_FILES) > 0
 
 BAI_OF = {lib: find_bam_index(bam) for lib, bam in BAM_OF.items()}
 missing_bai = [BAM_OF[lib] for lib, bai in BAI_OF.items() if bai is None]
@@ -212,10 +254,10 @@ if not Path(REF_FASTA).exists():
     raise ValueError("[CONFIG ERROR] reference FASTA does not exist: " + REF_FASTA)
 if not Path(REF_FASTA + ".fai").exists():
     raise ValueError("[CONFIG ERROR] reference FASTA index does not exist: " + REF_FASTA + ".fai")
-if ASH_ENABLED and (not ASH.get("bin") or not Path(ASH["bin"]).exists()):
-    raise ValueError("[CONFIG ERROR] ashleys.enabled is true but ashleys.bin is missing or does not exist")
-if ASH_ENABLED and (not ASH.get("model_path") or not Path(ASH["model_path"]).exists()):
-    raise ValueError("[CONFIG ERROR] ashleys.enabled is true but ashleys.model_path is missing or does not exist")
+if ASH_ENABLED and (ASH_NEEDS_FEATURE_RUN or ASH_NEEDS_PRED_RUN) and (not ASH.get("bin") or not Path(ASH["bin"]).exists()):
+    raise ValueError("[CONFIG ERROR] Ashley computation is needed but ashleys.bin is missing or does not exist")
+if ASH_ENABLED and ASH_NEEDS_PRED_RUN and (not ASH.get("model_path") or not Path(ASH["model_path"]).exists()):
+    raise ValueError("[CONFIG ERROR] Ashley prediction is needed but ashleys.model_path is missing or does not exist")
 
 # ================================= ASCII Art =================================
 print(r"""
@@ -244,7 +286,10 @@ print("- discovered libraries: " + str(len(SAMPLES)))
 print("  head -n 8: " + ", ".join(SAMPLES[:8]) + ("..." if len(SAMPLES)>8 else ""))
 print("- scTRIP counts info files: " + str(len(SCTRIP_COUNTS_INFO_FILES)))
 print("- target chromosomes: " + ("all reference contigs" if not TARGET_CHROMS else ",".join(TARGET_CHROMS)))
-print("- Ashley: " + ("ENABLED" if ASH_ENABLED else "disabled"))
+print("- Ashley computation: " + ("ENABLED" if ASH_ENABLED else "disabled"))
+print("- Ashley existing prediction tables: " + str(len(ASH_PRED_SOURCE_FILES)))
+print("- Ashley existing feature tables: " + str(len(ASH_FEATURE_SOURCE_FILES)))
+print("- Ashley merge into final_qc.tsv: " + ("yes" if ASH_MERGE_ENABLED else "no"))
 print("================================\n")
 
 # ---------------------------- Output structure ----------------------------
@@ -260,6 +305,8 @@ DIR_PLOTS  = out_path("plots")
 
 WIN_BED_GZ = out_path("windows_" + str(WIN_SIZE) + ".bed.gz")
 WIN_GC_GZ  = out_path("windows_" + str(WIN_SIZE) + ".gc.tsv.gz")
+FINAL_QC_TSV = out_path("final_qc.tsv")
+CORE_QC_TSV = out_path("intermediate", "core_qc.tsv")
 
 # Ashley
 ASH_FEATURES   = out_path("ashleys", "features.tsv")
@@ -274,6 +321,41 @@ SCTRIP_COUNTS_INFO_TSV = out_path("sctrip_counts_info.tsv")
 def ash_win_str():
     return " ".join(str(w) for w in ASH.get("win_sizes", ASH_DEFAULT["win_sizes"]))
 
+LARGE_BAM_THRESHOLD_MB = int(config.get("large_bam_threshold_mb", 800))
+BAM_RESOURCE_DEFAULTS = {
+    "alfred_qc": {
+        "small": {"partition": "short", "mem_mb": 8000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 16000, "time": "1-00:00:00"},
+    },
+    "coverage_counts": {
+        "small": {"partition": "short", "mem_mb": 12000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 32000, "time": "1-00:00:00"},
+    },
+    "preseq_lc": {
+        "small": {"partition": "short", "mem_mb": 8000, "time": "01:00:00"},
+        "large": {"partition": "medium", "mem_mb": 16000, "time": "1-00:00:00"},
+    },
+}
+BAM_RESOURCE_CONFIG = config.get("bam_resources", {})
+
+
+def bam_is_large(sample):
+    try:
+        return os.path.getsize(BAM_OF[sample]) > LARGE_BAM_THRESHOLD_MB * 1024 * 1024
+    except OSError as e:
+        raise ValueError("[CONFIG ERROR] could not stat BAM for resource selection: " + BAM_OF[sample] + " (" + str(e) + ")")
+
+
+def bam_resource_value(rule_name, sample, key):
+    profile = "large" if bam_is_large(sample) else "small"
+    rule_cfg = BAM_RESOURCE_CONFIG.get(rule_name, {})
+    profile_cfg = rule_cfg.get(profile, {})
+    return profile_cfg.get(key, BAM_RESOURCE_DEFAULTS[rule_name][profile][key])
+
+
+def bam_resource(rule_name, key):
+    return lambda wildcards: bam_resource_value(rule_name, wildcards.sample, key)
+
 # ============================== RULE ALL =====================================
 plot_targets = []
 if PLOT_TOGGLE:
@@ -282,7 +364,7 @@ if PLOT_TOGGLE:
 ALL_TARGETS = [
     LIBMAP_TSV,
     out_path("alignment_summary_metrics.tsv"),
-    out_path("final_qc.tsv"),
+    FINAL_QC_TSV,
     out_path("plots", "run_summary.pdf"),
     # always build preseq curves so the dir is populated
     *expand(out_path("preseq", "{sample}.lc.tsv"), sample=SAMPLES),
@@ -290,9 +372,6 @@ ALL_TARGETS = [
 ]
 if SCTRIP_COUNTS_AVAILABLE:
     ALL_TARGETS.append(SCTRIP_COUNTS_INFO_TSV)
-if ASH_ENABLED:
-    ALL_TARGETS.append(out_path("final_qc_with_ashleys.tsv"))
-
 rule all:
     input: ALL_TARGETS
 
@@ -305,6 +384,11 @@ rule alfred_qc:
         qc=out_path("stats-by-lib", "{sample}.qc.tsv.gz")
     conda: "envs/qc_env.yaml"
     threads: 4
+    resources:
+        mem_mb=bam_resource("alfred_qc", "mem_mb"),
+        partition=bam_resource("alfred_qc", "partition"),
+        qos="normal",
+        time=bam_resource("alfred_qc", "time")
     log:
         out_path("logs", "{sample}.alfred_qc.log")
     params:
@@ -408,10 +492,10 @@ rule coverage_counts:
         tsv=out_path("binned", "{sample}.bins.tsv.gz")
     threads: 2
     resources:
-        mem_mb=20000,
-        partition="medium",
+        mem_mb=bam_resource("coverage_counts", "mem_mb"),
+        partition=bam_resource("coverage_counts", "partition"),
         qos="normal",
-        time="04:00:00",
+        time=bam_resource("coverage_counts", "time"),
         tmpdir=TMP_DIR
     conda: "envs/py_env.yaml"
     log:
@@ -513,10 +597,10 @@ rule preseq_lc:
         tsv=out_path("preseq", "{sample}.lc.tsv")
     threads: 4
     resources:
-        mem_mb=8000,
-        partition="short",
+        mem_mb=bam_resource("preseq_lc", "mem_mb"),
+        partition=bam_resource("preseq_lc", "partition"),
         qos="normal",
-        time="01:30:00",
+        time=bam_resource("preseq_lc", "time"),
         tmpdir=TMP_DIR
     conda: "envs/preseq.yaml"
     log:
@@ -646,13 +730,13 @@ rule aggregate_sctrip_counts_info:
           {input.counts} > {log} 2>&1
         """
 
-rule make_sample_final_qc:
+rule make_core_qc:
     input:
         alfred=out_path("alignment_summary_metrics.tsv"),
         qc2=expand(out_path("qc-from-bins", "{sample}.counts_qc.tsv"), sample=SAMPLES),
         sctrip=SCTRIP_COUNTS_INFO_TSV if SCTRIP_COUNTS_AVAILABLE else []
     output:
-        final=out_path("final_qc.tsv")
+        final=CORE_QC_TSV
     threads: 2
     resources:
         mem_mb=20000,
@@ -758,7 +842,7 @@ rule make_sample_final_qc:
 
         # Ensure keys exist
         if "Library" not in dfA.columns:
-            raise ValueError("[make_sample_final_qc] alignment_summary_metrics.tsv lacks 'Library'")
+            raise ValueError("[make_core_qc] alignment_summary_metrics.tsv lacks 'Library'")
         if "Sample" not in dfA.columns:
             # If Sample ever disappears from Alfred ME extraction, keep pipeline alive
             dfA["Sample"] = dfA["Library"].astype(str).str.replace(r"_A\d+_L\d+_i\d+.*$", "", regex=True)
@@ -811,7 +895,7 @@ rule make_sample_final_qc:
         if sctrip_paths and os.path.exists(sctrip_paths[0]) and os.path.getsize(sctrip_paths[0]) > 0:
             dfS = pd.read_csv(sctrip_paths[0], sep="\t")
             if "Library" not in dfS.columns:
-                raise ValueError("[make_sample_final_qc] sctrip_counts_info.tsv lacks 'Library'")
+                raise ValueError("[make_core_qc] sctrip_counts_info.tsv lacks 'Library'")
             valid = dfS["Library"].notna() & (dfS["Library"].astype(str).str.len() > 0)
             dfS = dfS.loc[valid].drop_duplicates(subset=["Library"], keep="first")
             merged = merged.merge(dfS, on="Library", how="left")
@@ -834,7 +918,7 @@ rule make_sample_final_qc:
 # --------------------------- OPTIONAL PLOTTING -------------------------------
 rule plot_qc:
     input:
-        final=out_path("final_qc.tsv"),
+        final=FINAL_QC_TSV,
         preseq=lambda wc: out_path("preseq", wc.sample + ".lc.tsv")
     output:
         pdf=out_path("plots", "per-lib-qc", "{sample}.qc.pdf")
@@ -875,7 +959,7 @@ rule plot_qc:
 
 rule plot_run_summary_R:
     input:
-        final=out_path("final_qc.tsv")
+        final=FINAL_QC_TSV
     output:
         pdf=out_path("plots", "run_summary.pdf")
     threads: 1
@@ -918,8 +1002,10 @@ rule write_library_map:
             })
         pd.DataFrame(rows).to_csv(output[0], sep="\t", index=False)
 
-# Merge existing Ashley features or compute them; then normalize to Library
+# Merge existing Ashley features or compute them when Ashley computation is enabled.
 rule ashleys_labels_or_features:
+    input:
+        source=ASH_FEATURE_SOURCE_FILES
     output:
         features = ASH_FEATURES
     threads: ASH.get("threads", 32)
@@ -928,56 +1014,51 @@ rule ashleys_labels_or_features:
         partition = "highmem",
         qos = "normal",
         time = "1-00:00:00"
-    conda: ASH.get("conda_env", "envs/ashleys.yaml")
+    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_NEEDS_FEATURE_RUN else "envs/py_env.yaml"
     log:
         out_path("ashleys", "logs", "features_or_labels.log")
     params:
-        folder   = str(DATA_ROOT),
-        windows  = ash_win_str(),
-        extension= BAM_EXT,
-        bin      = ASH.get("bin", ASH_DEFAULT["bin"])
+        folder=str(DATA_ROOT),
+        windows=ash_win_str(),
+        extension=BAM_EXT,
+        bin=ASH.get("bin", ASH_DEFAULT["bin"]),
+        source_count=len(ASH_FEATURE_SOURCE_FILES),
+        enabled=ASH_ENABLED
     shell:
         r"""
         set -euo pipefail
         mkdir -p "$(dirname {log})" "$(dirname {output.features})"
 
-        RUN_DIR="{params.folder}"
-        MODE="FLAT"
-        if find "$RUN_DIR" -mindepth 2 -maxdepth 2 -type d -name bam -print -quit | grep -q .; then
-          MODE="HIER"
-        fi
-
-        # Prefer merging any precomputed features if present
-        if [[ "$MODE" == "HIER" ]] && \
-           find "$RUN_DIR" -type f \( -path '*/predictions/ashleys_features.tsv' -o -path '*/prediction/ashleys_features.tsv' -o -path '*/predicitons/ashleys_features.tsv' \) -print -quit | grep -q .; then
-
+        if [[ {params.source_count} -gt 0 ]]; then
           TMP="{output.features}.tmp"
-          find "$RUN_DIR" -type f \
-            \( -path '*/predictions/ashleys_features.tsv' -o -path '*/prediction/ashleys_features.tsv' -o -path '*/predicitons/ashleys_features.tsv' \) \
-            -print | sort \
-            | xargs awk 'FNR==1 && NR>1 {{next}} {{print}}' > "$TMP"
-
+          awk 'FNR==1 && NR>1 {{next}} {{print}}' {input.source} > "$TMP"
           test -s "$TMP"
           mv -f "$TMP" "{output.features}"
-        else
-          # Compute features from BAMs
-          ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
-          export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
-          python -u "{params.bin}" -j {threads} features \
-            -f "{params.folder}" \
-            -w {params.windows} \
-            -o "{output.features}" \
-            --recursive_collect \
-            -e "{params.extension}" >> "{log}" 2>&1
-
-          test -s "{output.features}"
+          exit 0
         fi
+
+        if [[ "{params.enabled}" != "True" ]]; then
+          echo "[ashleys_features] No existing Ashley feature table found and ashleys.enabled is false." > "{log}"
+          exit 1
+        fi
+
+        ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
+        export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
+        python -u "{params.bin}" -j {threads} features \
+          -f "{params.folder}" \
+          -w {params.windows} \
+          -o "{output.features}" \
+          --recursive_collect \
+          -e "{params.extension}" >> "{log}" 2>&1
+
+        test -s "{output.features}"
         """
 
-# Merge labels (if any) or predict from features, then normalize to Library
+# Merge existing labels/predictions or predict from features when Ashley computation is enabled.
 rule ashleys_predict_or_copy:
     input:
-        features = rules.ashleys_labels_or_features.output.features
+        source=ASH_PRED_SOURCE_FILES,
+        features=ASH_FEATURES if ASH_ENABLED and len(ASH_PRED_SOURCE_FILES) == 0 else []
     output:
         pred_dir = directory(ASH_PRED_DIR),
         pred     = ASH_PRED_TSV
@@ -987,72 +1068,85 @@ rule ashleys_predict_or_copy:
         partition = "medium",
         qos = "normal",
         time = "04:00:00"
-    conda: ASH.get("conda_env", "envs/ashleys.yaml")
+    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_NEEDS_PRED_RUN else "envs/py_env.yaml"
     log:
         out_path("ashleys", "logs", "predict_or_copy.log")
     params:
-        folder = str(DATA_ROOT),
-        bin   = ASH.get("bin", ASH_DEFAULT["bin"]),
-        model = ASH.get("model_path", ASH_DEFAULT["model_path"])
+        bin=ASH.get("bin", ASH_DEFAULT["bin"]),
+        model=ASH.get("model_path", ASH_DEFAULT["model_path"]),
+        source_count=len(ASH_PRED_SOURCE_FILES),
+        enabled=ASH_ENABLED
     shell:
         r"""
         set -euo pipefail
-        RUN_DIR="{params.folder}"
         mkdir -p "{output.pred_dir}" "$(dirname {log})"
 
-        # Try to merge any labels.tsv produced by upstream tools
-        if find "$RUN_DIR" -type f \
-             \( -path '*/cell_selection/labels.tsv' -o -path '*/predictions/labels.tsv' -o -path '*/prediction/labels.tsv' \) \
-             -print -quit | grep -q .; then
-
+        if [[ {params.source_count} -gt 0 ]]; then
           TMP="{output.pred}.tmp"
-          find "$RUN_DIR" -type f \
-            \( -path '*/cell_selection/labels.tsv' -o -path '*/predictions/labels.tsv' -o -path '*/prediction/labels.tsv' \) \
-            -print | sort \
-            | xargs awk 'FNR==1 && NR>1 {{next}} {{print}}' > "$TMP"
-
+          awk 'FNR==1 && NR>1 {{next}} {{print}}' {input.source} > "$TMP"
           test -s "$TMP"
           mv -f "$TMP" "{output.pred}"
           exit 0
         fi
 
-        # Fallback: run predict from features.tsv
+        if [[ "{params.enabled}" != "True" ]]; then
+          echo "[ashleys_predict_or_copy] No existing Ashley prediction table found and ashleys.enabled is false." > "{log}"
+          exit 1
+        fi
+
         ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
         export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
         python -u "{params.bin}" -j {threads} predict \
           -p "{input.features}" \
           -o "{output.pred_dir}" \
-          -m "{params.model}"
+          -m "{params.model}" \
+          >> "{log}" 2>&1
 
         test -s "{output.pred}"
         """
 
+if ASH_MERGE_ENABLED:
+    rule finalize_qc:
+        input:
+            core=CORE_QC_TSV,
+            pred=ASH_PRED_TSV,
+            feat=ASH_FEATURES if ASH_FEATURES_AVAILABLE else []
+        output:
+            final=FINAL_QC_TSV
+        log:
+            out_path("logs", "final_qc.log")
+        conda:
+            "envs/R_merge.yaml"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {log})" "$(dirname {output.final})"
 
-# Final merge (R) with Ashley tables.
-rule merge_final_qc_with_ashleys:
-    input:
-        final = out_path("final_qc.tsv"),
-        pred  = out_path("ashleys/prediction/prediction.tsv"),
-        feat  = out_path("ashleys/features.tsv")
-    output:
-        merged = out_path("final_qc_with_ashleys.tsv")
-    log:
-        out_path("logs/merge_final_qc_with_ashleys.log")
-    conda:
-        "envs/R_merge.yaml"
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p "$(dirname {log})" "$(dirname {output.merged})"
+            FEAT_ARG=""
+            if [[ -n "{input.feat}" ]] && [[ -s "{input.feat}" ]]; then
+              FEAT_ARG="--feat {input.feat}"
+            fi
 
-        FEAT_ARG=""
-        [[ -s "{input.feat}" ]] && FEAT_ARG="--feat {input.feat}"
-
-        # Write directly to the declared output path; no copies afterwards.
-        Rscript workflow/scripts/merge_ashleys.R \
-          --final "{input.final}" \
-          --pred  "{input.pred}" \
-          ${{FEAT_ARG}} \
-          --out  "{output.merged}" \
-          > "{log}" 2>&1
-        """
+            Rscript workflow/scripts/merge_ashleys.R \
+              --final "{input.core}" \
+              --pred  "{input.pred}" \
+              ${{FEAT_ARG}} \
+              --out  "{output.final}" \
+              > "{log}" 2>&1
+            """
+else:
+    rule finalize_qc:
+        input:
+            core=CORE_QC_TSV
+        output:
+            final=FINAL_QC_TSV
+        log:
+            out_path("logs", "final_qc.log")
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p "$(dirname {log})" "$(dirname {output.final})"
+            cp "{input.core}" "{output.final}.tmp"
+            mv -f "{output.final}.tmp" "{output.final}"
+            echo "[finalize_qc] Ashley merge disabled or unavailable; wrote core QC to {output.final}" > "{log}"
+            """
