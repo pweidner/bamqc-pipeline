@@ -4,20 +4,32 @@ import numpy as np
 import pandas as pd
 
 def read_counts(path):
-    # Expect: BED3(+anything) + last column = counts (bedtools coverage -counts)
-    # Works with .gz or plain text
+    """Read per-window counts.
+
+    Supported formats:
+    - legacy: chrom, start, end, counts
+    - strand-aware: chrom, start, end, watson_count, crick_count, counts
+    """
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as fh:
-        # try generic tab headerless; infer last col as counts
         df = pd.read_csv(fh, sep="\t", header=None, comment="#")
     if df.shape[1] < 4:
         raise ValueError(f"{path}: expected at least 4 columns (chrom, start, end, counts). Got {df.shape[1]}")
-    df.columns = [*(["chrom","start","end"] + [f"c{i}" for i in range(3, df.shape[1]-1)]), "counts"]
-    # enforce numeric
+
+    if df.shape[1] == 6:
+        df.columns = ["chrom", "start", "end", "watson_count", "crick_count", "counts"]
+    else:
+        df.columns = [*(
+            ["chrom", "start", "end"] + [f"c{i}" for i in range(3, df.shape[1] - 1)]
+        ), "counts"]
+
     df["start"] = pd.to_numeric(df["start"], errors="coerce")
-    df["end"]   = pd.to_numeric(df["end"],   errors="coerce")
-    df["counts"]= pd.to_numeric(df["counts"],errors="coerce").fillna(0)
-    df["binsize"]= (df["end"] - df["start"]).astype(np.int64)
+    df["end"] = pd.to_numeric(df["end"], errors="coerce")
+    df["counts"] = pd.to_numeric(df["counts"], errors="coerce").fillna(0)
+    for col in ("watson_count", "crick_count"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["binsize"] = (df["end"] - df["start"]).astype(np.int64)
     return df
 
 def entropy(counts: np.ndarray) -> float:
@@ -76,6 +88,37 @@ def mad(counts: np.ndarray) -> float:
     med = np.median(counts)
     return float(np.median(np.abs(counts - med)))
 
+def background_estimate(df: pd.DataFrame) -> float:
+    """Estimate strand background from Watson/Crick-biased bins.
+
+    This follows the breakpointR idea: classify bins by W-C balance, estimate
+    Crick leakage in WW bins and Watson leakage in CC bins, then average the
+    available estimates. Watson is the minus strand, Crick the plus strand.
+    """
+    if not {"watson_count", "crick_count"}.issubset(df.columns):
+        return np.nan
+
+    w = df["watson_count"].to_numpy(dtype=float)
+    c = df["crick_count"].to_numpy(dtype=float)
+    total = w + c
+    informative = total >= 10
+    if not np.any(informative):
+        return np.nan
+
+    ratio = np.full(total.shape, np.nan, dtype=float)
+    ratio[informative] = (w[informative] - c[informative]) / total[informative]
+    ww = informative & (ratio > 0.8)
+    cc = informative & (ratio < -0.8)
+
+    estimates = []
+    if np.any(ww):
+        estimates.append((c[ww].sum() + ww.sum()) / (w[ww].sum() + ww.sum()))
+    if np.any(cc):
+        estimates.append((w[cc].sum() + cc.sum()) / (c[cc].sum() + cc.sum()))
+
+    return float(np.mean(estimates)) if estimates else np.nan
+
+
 def read_gc_table(gc_path):
     """
     Expect a table aligned to the same windows with a GC column in [0,1] or [0,100].
@@ -126,6 +169,7 @@ def main():
     df = read_counts(args.counts)
     counts = df["counts"].values.astype(float)
     binsize_mean = float(df["binsize"].mean()) if "binsize" in df else np.nan
+    bin_background = background_estimate(df)
 
     # Basic summary
     total = float(counts.sum())
@@ -233,6 +277,7 @@ def main():
         "coverage_sd": sd_cov,
         "fold80_penalty": fold80,
         "gc_pearson_r": gc_r,
+        "background": bin_background,
         "preseq_distinct_at_observed": complexity_at_observed,
         "preseq_saturation": complexity_saturation,
         "preseq_curve_status": preseq_status,

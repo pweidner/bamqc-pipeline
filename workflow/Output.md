@@ -13,6 +13,10 @@
   absent for a sample.
 - `alignment_summary_metrics.tsv`: parsed Alfred `ME` metrics before final
   column normalization.
+- `binned/{Library}.bins.tsv.gz`: per-window `chrom`, `start`, `end`,
+  Watson/minus count, Crick/plus count, and total count. Older four-column
+  count files remain readable by the QC script but cannot produce
+  `bin_background`.
 - `metadata/library_map.tsv`: mapping from input BAM basename to the stable
   `Library` identifier used throughout the workflow.
 
@@ -20,7 +24,9 @@
 
 - `Library` and `Sample` are the join keys.
 - `alf_*` columns come from Alfred.
-- `bin_*` columns come from genome-window read counts.
+- `bin_*` columns come from genome-window read counts; `bin_background` is a
+  breakpointR-inspired single-value strand background estimate from
+  Watson/Crick-biased bins.
 - `preseq_*` columns come from preseq library-complexity curves.
 - `sctrip_*` columns come from optional HIER scTRIP/mosaicatcher counts info
   tables.

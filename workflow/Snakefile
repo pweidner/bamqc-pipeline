@@ -517,6 +517,10 @@ rule coverage_counts:
         tbed="${{tmpdir}}/${{fprefix}}.targets.bed"
         hwin="${{tmpdir}}/${{fprefix}}.windows.harmonized.bed.gz"
         wbed="{input.win}"
+        hwin_w="${{tmpdir}}/${{fprefix}}.windows.watson.bed"
+        hwin_c="${{tmpdir}}/${{fprefix}}.windows.crick.bed"
+        wcounts="${{tmpdir}}/${{fprefix}}.watson.counts.tsv"
+        ccounts="${{tmpdir}}/${{fprefix}}.crick.counts.tsv"
         target_chroms="{params.target_chroms}"
 
         # Build genome file (chrom\tlength)
@@ -554,16 +558,36 @@ rule coverage_counts:
           | bedtools sort -g "${{tgfile}}" -i - \
           | bgzip -c > "${{hwin}}"
 
+        zcat "${{hwin}}" \
+          | awk 'BEGIN{{OFS="\t"}} {{print $1,$2,$3,$1 ":" $2 "-" $3,0,"-"}}' \
+          > "${{hwin_w}}"
+        zcat "${{hwin}}" \
+          | awk 'BEGIN{{OFS="\t"}} {{print $1,$2,$3,$1 ":" $2 "-" $3,0,"+"}}' \
+          > "${{hwin_c}}"
+
         bedtools coverage \
           -sorted \
           -g "${{tgfile}}" \
-          -a "${{hwin}}" \
+          -a "${{hwin_w}}" \
           -b "${{fbam}}" \
           -counts \
-          2>> {log} \
+          -s \
+          2>> {log} > "${{wcounts}}"
+
+        bedtools coverage \
+          -sorted \
+          -g "${{tgfile}}" \
+          -a "${{hwin_c}}" \
+          -b "${{fbam}}" \
+          -counts \
+          -s \
+          2>> {log} > "${{ccounts}}"
+
+        paste "${{wcounts}}" "${{ccounts}}" \
+          | awk 'BEGIN{{OFS="\t"}} {{w=$7+0; c=$14+0; print $1,$2,$3,w,c,w+c}}' \
           | bgzip -c > {output.tsv}
 
-        rm -f "${{fbam}}" "${{fbam}}.bai" "${{hwin}}" "${{tbed}}" "${{gfile}}" "${{tgfile}}"
+        rm -f "${{fbam}}" "${{fbam}}.bai" "${{hwin}}" "${{hwin_w}}" "${{hwin_c}}" "${{wcounts}}" "${{ccounts}}" "${{tbed}}" "${{gfile}}" "${{tgfile}}"
         """
 
 rule windows_gc:
@@ -827,6 +851,7 @@ rule make_core_qc:
             "coverage_sd": "bin_sd",
             "fold80_penalty": "bin_fold80",
             "gc_pearson_r": "bin_gc_r",
+            "background": "bin_background",
             "pct_ge_1x": "bin_pct_ge_1x",
             "pct_ge_10x": "bin_pct_ge_10x",
             "pct_ge_30x": "bin_pct_ge_30x",
