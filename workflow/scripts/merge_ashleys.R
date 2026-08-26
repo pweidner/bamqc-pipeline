@@ -1,11 +1,9 @@
 #!/usr/bin/env Rscript
 suppressPackageStartupMessages({
-  library(argparse)
   library(readr)
   library(dplyr)
   library(stringr)
   library(tibble)
-  library(purrr)
 })
 
 strip_bam <- function(x) {
@@ -22,6 +20,27 @@ strip_bam <- function(x) {
 
 read_tsv_quiet <- function(path, ...) {
   readr::read_tsv(path, guess_max = 1e6, show_col_types = FALSE, progress = FALSE, ...)
+}
+
+parse_cli_args <- function(argv) {
+  if (length(argv) %% 2 != 0) {
+    stop("Expected command-line arguments as --key value pairs.")
+  }
+  args <- list()
+  if (length(argv) > 0) {
+    for (i in seq(1, length(argv), by = 2)) {
+      key <- sub("^--", "", argv[[i]])
+      args[[key]] <- argv[[i + 1]]
+    }
+  }
+  missing <- setdiff(c("final", "pred", "out"), names(args))
+  if (length(missing) > 0) {
+    stop("Missing required arguments: ", paste(paste0("--", missing), collapse = ", "))
+  }
+  if (is.null(args$feat)) {
+    args$feat <- NULL
+  }
+  args
 }
 
 # Find a column in df by case-insensitive match
@@ -43,18 +62,44 @@ remove_literal_prefix <- function(x, prefix) {
   x2
 }
 
-# Normalize Ashley prediction keys → Library_key that matches our Library format
+# Normalize Ashley prediction keys. Historical tables may lack Sample or rows.
 normalize_pred_keys <- function(pred) {
-  need <- c("cell","sample")
-  miss <- setdiff(need, names(pred))
-  if (length(miss) > 0) {
-    stop("prediction.tsv missing required columns: ", paste(miss, collapse=", "))
+  cell_col <- find_col_ci(pred, c("cell", "sample_name", "library", "Library"))
+  sample_col <- find_col_ci(pred, c("sample", "Sample", "sample_id"))
+  pred_col <- find_col_ci(pred, c("prediction", "label", "ash_label"))
+  prob_col <- find_col_ci(pred, c("probability", "prob", "ash_prob"))
+
+  if (is.null(cell_col)) {
+    stop("prediction.tsv missing required cell column; columns are: ", paste(names(pred), collapse=", "))
   }
-  pred %>%
+
+  out <- tibble(
+    cell = as.character(pred[[cell_col]]),
+    sample = if (!is.null(sample_col)) as.character(pred[[sample_col]]) else NA_character_,
+    prediction = if (!is.null(pred_col)) as.character(pred[[pred_col]]) else NA_character_,
+    probability = if (!is.null(prob_col)) suppressWarnings(as.numeric(pred[[prob_col]])) else NA_real_
+  ) %>%
+    filter(!is.na(.data$cell), .data$cell != "") %>%
     mutate(
-      Base        = strip_bam(.data$cell),                     # A5573_L1_i301
-      Library_key = paste0(.data$sample, "_", .data$Base, ".sort.mdup")
+      Base = strip_bam(.data$cell),
+      Library_key = if_else(
+        !is.na(.data$sample) & .data$sample != "",
+        paste0(.data$sample, "_", .data$Base, ".sort.mdup"),
+        NA_character_
+      )
     )
+
+  if (is.null(pred_col)) {
+    warning("[merge_ashleys] prediction.tsv lacks a prediction/label column; ash_label will be NA.")
+  }
+  if (is.null(prob_col)) {
+    warning("[merge_ashleys] prediction.tsv lacks a probability/prob column; ash_prob will be NA.")
+  }
+  if (is.null(sample_col) && nrow(out) > 0) {
+    warning("[merge_ashleys] prediction.tsv lacks sample column; joining predictions by unique cell basename.")
+  }
+
+  out
 }
 
 # Normalize Ashley features keys → Base
@@ -86,12 +131,7 @@ normalize_ash_feature_name <- function(nm) {
   nm2
 }
 
-ap <- argparse::ArgumentParser(description = "Merge final QC with Ashley prediction (and optional features).")
-ap$add_argument("--final", required = TRUE, help = "Path to final_qc.tsv")
-ap$add_argument("--pred",  required = TRUE, help = "Path to ashleys/prediction/prediction.tsv")
-ap$add_argument("--feat",  required = FALSE, default = NULL, help = "Optional path to ashleys/features.tsv")
-ap$add_argument("--out",   required = TRUE, help = "Output: final_qc.tsv")
-args <- ap$parse_args()
+args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
 
 final_path <- normalizePath(args$final, mustWork = TRUE)
 pred_path  <- normalizePath(args$pred,  mustWork = TRUE)
@@ -125,17 +165,49 @@ final <- final %>% mutate(Library_key = paste0(.data$Sample_raw, "_", .data$Base
 message("[merge_ashleys] Joining Ashley predictions ...")
 pred2 <- normalize_pred_keys(pred)
 
-pred_min <- pred2 %>%
-  transmute(
-    Library_key = .data$Library_key,
-    ash_cell    = .data$cell,
-    ash_sample  = .data$sample,
-    ash_label   = .data$prediction,
-    ash_prob    = .data$probability
-  )
+if (nrow(pred2) == 0) {
+  merged <- final %>%
+    mutate(
+      ash_cell = NA_character_,
+      ash_sample = NA_character_,
+      ash_label = NA_character_,
+      ash_prob = NA_real_
+    )
+  message("[merge_ashleys] No Ashley prediction rows found; keeping ash_* prediction columns as NA.")
+} else if (any(!is.na(pred2$Library_key))) {
+  pred_min <- pred2 %>%
+    filter(!is.na(.data$Library_key)) %>%
+    distinct(.data$Library_key, .keep_all = TRUE) %>%
+    transmute(
+      Library_key = .data$Library_key,
+      ash_cell    = .data$cell,
+      ash_sample  = .data$sample,
+      ash_label   = .data$prediction,
+      ash_prob    = .data$probability
+    )
 
-merged <- final %>% left_join(pred_min, by = "Library_key")
-message("[merge_ashleys] Matched predictions: ", sum(!is.na(merged$ash_label)), " / ", nrow(merged))
+  merged <- final %>% left_join(pred_min, by = "Library_key")
+  message("[merge_ashleys] Matched predictions: ", sum(!is.na(merged$ash_cell)), " / ", nrow(merged))
+} else {
+  if (any(duplicated(final$Base))) {
+    stop("[merge_ashleys] prediction.tsv has no sample column and final table has duplicated cell basenames; cannot join unambiguously.")
+  }
+  if (any(duplicated(pred2$Base))) {
+    stop("[merge_ashleys] prediction.tsv has no sample column and duplicated cell basenames; cannot join unambiguously.")
+  }
+
+  pred_min <- pred2 %>%
+    transmute(
+      Base = .data$Base,
+      ash_cell = .data$cell,
+      ash_sample = NA_character_,
+      ash_label = .data$prediction,
+      ash_prob = .data$probability
+    )
+
+  merged <- final %>% left_join(pred_min, by = "Base")
+  message("[merge_ashleys] Matched predictions by basename: ", sum(!is.na(merged$ash_cell)), " / ", nrow(merged))
+}
 
 # ---- Join features (optional) ----
 if (!is.null(feat_path) && file.exists(feat_path) && file.info(feat_path)$size > 0) {
@@ -149,6 +221,11 @@ if (!is.null(feat_path) && file.exists(feat_path) && file.info(feat_path)$size >
     feat_pref <- feat %>%
       mutate(Base = strip_bam(.data$Base)) %>%
       rename_with(.cols = all_of(feat_cols), .fn = ~ paste0("ash_", normalize_ash_feature_name(.x)))
+
+    if (any(duplicated(feat_pref$Base))) {
+      warning("[merge_ashleys] features.tsv has duplicated cell basenames; keeping the first feature row per basename.")
+      feat_pref <- feat_pref %>% distinct(.data$Base, .keep_all = TRUE)
+    }
 
     merged <- merged %>% left_join(feat_pref, by = "Base")
     message("[merge_ashleys] Feature columns added: ", length(setdiff(names(feat_pref), "Base")))

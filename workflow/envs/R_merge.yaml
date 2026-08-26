@@ -6,7 +6,5 @@ dependencies:
   - r-dplyr
   - r-stringr
   - r-tibble
-  - r-argparse
-  - r-purrr
   - r-tidyr
 

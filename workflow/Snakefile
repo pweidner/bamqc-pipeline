@@ -1083,7 +1083,7 @@ rule ashleys_labels_or_features:
 rule ashleys_predict_or_copy:
     input:
         source=ASH_PRED_SOURCE_FILES,
-        features=ASH_FEATURES if ASH_ENABLED and len(ASH_PRED_SOURCE_FILES) == 0 else []
+        features=ASH_FEATURES if ASH_ENABLED else []
     output:
         pred_dir = directory(ASH_PRED_DIR),
         pred     = ASH_PRED_TSV
@@ -1093,7 +1093,7 @@ rule ashleys_predict_or_copy:
         partition = "medium",
         qos = "normal",
         time = "04:00:00"
-    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_NEEDS_PRED_RUN else "envs/py_env.yaml"
+    conda: ASH.get("conda_env", "envs/ashleys.yaml") if ASH_ENABLED else "envs/py_env.yaml"
     log:
         out_path("ashleys", "logs", "predict_or_copy.log")
     params:
@@ -1105,22 +1105,36 @@ rule ashleys_predict_or_copy:
         r"""
         set -euo pipefail
         mkdir -p "{output.pred_dir}" "$(dirname {log})"
+        : > "{log}"
 
         if [[ {params.source_count} -gt 0 ]]; then
           TMP="{output.pred}.tmp"
           awk 'FNR==1 && NR>1 {{next}} {{print}}' {input.source} > "$TMP"
           test -s "$TMP"
-          mv -f "$TMP" "{output.pred}"
-          exit 0
+          data_rows=$(awk 'END{{print (NR > 1 ? NR - 1 : 0)}}' "$TMP")
+          if [[ "$data_rows" -gt 0 ]]; then
+            echo "[ashleys_predict_or_copy] Copied existing Ashley prediction rows: $data_rows" >> "{log}"
+            mv -f "$TMP" "{output.pred}"
+            exit 0
+          fi
+          echo "[ashleys_predict_or_copy] Existing Ashley prediction tables contain no data rows; treating predictions as missing." >> "{log}"
+          rm -f "$TMP"
         fi
 
         if [[ "{params.enabled}" != "True" ]]; then
-          echo "[ashleys_predict_or_copy] No existing Ashley prediction table found and ashleys.enabled is false." > "{log}"
+          printf "cell\tprobability\tprediction\n" > "{output.pred}"
+          echo "[ashleys_predict_or_copy] Ashley prediction missing and ashleys.enabled is false; wrote empty prediction table." >> "{log}"
+          exit 0
+        fi
+
+        if [[ -z "{input.features}" ]] || [[ ! -s "{input.features}" ]]; then
+          echo "[ashleys_predict_or_copy] Ashley prediction is missing, but features are unavailable: {input.features}" >> "{log}"
           exit 1
         fi
 
         ASHLEY_ROOT="$(cd "$(dirname "{params.bin}")/.." && pwd)"
         export PYTHONPATH="${{ASHLEY_ROOT}}/src:${{PYTHONPATH:-}}"
+        echo "[ashleys_predict_or_copy] Running Ashley prediction from features." >> "{log}"
         python -u "{params.bin}" -j {threads} predict \
           -p "{input.features}" \
           -o "{output.pred_dir}" \
@@ -1128,6 +1142,7 @@ rule ashleys_predict_or_copy:
           >> "{log}" 2>&1
 
         test -s "{output.pred}"
+
         """
 
 if ASH_MERGE_ENABLED:
