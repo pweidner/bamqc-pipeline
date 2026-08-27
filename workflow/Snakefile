@@ -512,6 +512,7 @@ rule coverage_counts:
         mkdir -p {params.bins_dir} {params.log_dir} "${{tmpdir}}"
         fprefix="{wildcards.sample}"
         fbam="${{tmpdir}}/${{fprefix}}.target.filtered.bam"
+        sbam="${{tmpdir}}/${{fprefix}}.target.filtered.read1.bam"
         gfile="${{tmpdir}}/${{fprefix}}.genome"
         tgfile="${{tmpdir}}/${{fprefix}}.targets.genome"
         tbed="${{tmpdir}}/${{fprefix}}.targets.bed"
@@ -519,6 +520,7 @@ rule coverage_counts:
         wbed="{input.win}"
         hwin_w="${{tmpdir}}/${{fprefix}}.windows.watson.bed"
         hwin_c="${{tmpdir}}/${{fprefix}}.windows.crick.bed"
+        tcounts="${{tmpdir}}/${{fprefix}}.total.counts.tsv"
         wcounts="${{tmpdir}}/${{fprefix}}.watson.counts.tsv"
         ccounts="${{tmpdir}}/${{fprefix}}.crick.counts.tsv"
         target_chroms="{params.target_chroms}"
@@ -547,6 +549,7 @@ rule coverage_counts:
 
         samtools view -@ {threads} -b -F 3584 -q 10 -L "${{tbed}}" {input.bam} -o "${{fbam}}"
         samtools index -@ {threads} "${{fbam}}"
+        samtools view -@ {threads} -b -F 128 "${{fbam}}" -o "${{sbam}}"
 
         zcat "${{wbed}}" \
           | awk -v bam_has_chr="${{bam_has_chr}}" 'BEGIN{{OFS="\t"}}
@@ -568,8 +571,16 @@ rule coverage_counts:
         bedtools coverage \
           -sorted \
           -g "${{tgfile}}" \
-          -a "${{hwin_w}}" \
+          -a "${{hwin}}" \
           -b "${{fbam}}" \
+          -counts \
+          2>> {log} > "${{tcounts}}"
+
+        bedtools coverage \
+          -sorted \
+          -g "${{tgfile}}" \
+          -a "${{hwin_w}}" \
+          -b "${{sbam}}" \
           -counts \
           -s \
           2>> {log} > "${{wcounts}}"
@@ -578,16 +589,16 @@ rule coverage_counts:
           -sorted \
           -g "${{tgfile}}" \
           -a "${{hwin_c}}" \
-          -b "${{fbam}}" \
+          -b "${{sbam}}" \
           -counts \
           -s \
           2>> {log} > "${{ccounts}}"
 
-        paste "${{wcounts}}" "${{ccounts}}" \
-          | awk 'BEGIN{{OFS="\t"}} {{w=$7+0; c=$14+0; print $1,$2,$3,w,c,w+c}}' \
+        paste "${{wcounts}}" "${{ccounts}}" "${{tcounts}}" \
+          | awk 'BEGIN{{OFS="\t"}} {{w=$7+0; c=$14+0; t=$18+0; print $1,$2,$3,w,c,t}}' \
           | bgzip -c > {output.tsv}
 
-        rm -f "${{fbam}}" "${{fbam}}.bai" "${{hwin}}" "${{hwin_w}}" "${{hwin_c}}" "${{wcounts}}" "${{ccounts}}" "${{tbed}}" "${{gfile}}" "${{tgfile}}"
+        rm -f "${{fbam}}" "${{fbam}}.bai" "${{sbam}}" "${{hwin}}" "${{hwin_w}}" "${{hwin_c}}" "${{tcounts}}" "${{wcounts}}" "${{ccounts}}" "${{tbed}}" "${{gfile}}" "${{tgfile}}"
         """
 
 rule windows_gc:

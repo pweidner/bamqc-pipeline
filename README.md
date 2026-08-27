@@ -112,7 +112,7 @@ output_location/
 │   └── {Library}.qc.tsv.gz              # per-library Alfred output
 │
 ├── binned/
-│   └── {Library}.bins.tsv.gz            # chrom/start/end/Watson/Crick/total bin counts
+│   └── {Library}.bins.tsv.gz            # chrom/start/end/Watson/Crick read1/total bin counts
 │
 ├── qc-from-bins/
 │   └── {Library}.counts_qc.tsv          # bin-derived metrics before final merge
@@ -224,7 +224,7 @@ Metrics derived from **`alfred qc`**, summarizing mapping, alignment accuracy, a
 
 ## 3. Bin-wise coverage metrics (`bin_*`)
 
-Computed from fixed-size genome windows using `bedtools coverage -counts` and summarized in `qc_from_counts.py`. New bin files store Watson-strand (`-`), Crick-strand (`+`), and total counts per window so the same scheduled job can support both coverage-shape QC and background estimation.
+Computed from fixed-size genome windows using `bedtools coverage -counts` and summarized in `qc_from_counts.py`. Bin files store Watson-strand (`-`) and Crick-strand (`+`) counts from non-read2 reads plus total filtered read counts per window, so the same scheduled job supports coverage-shape QC and Strand-seq background estimation.
 
 ### Basic bin descriptors
 
